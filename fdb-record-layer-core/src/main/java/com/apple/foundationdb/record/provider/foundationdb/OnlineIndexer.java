@@ -82,7 +82,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Queue;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -182,7 +181,7 @@ public class OnlineIndexer implements AutoCloseable {
     private static final Object INDEX_BUILD_LOCK_KEY = 0L;
     private static final Object INDEX_BUILD_SCANNED_RECORDS = 1L;
 
-    @Nonnull private UUID onlineIndexerId = UUID.randomUUID();
+    @Nonnull private OnlineIndexerCommon common;
 
     @Nonnull private final FDBDatabaseRunner runner;
     @Nullable private SynchronizedSessionRunner synchronizedSessionRunner;
@@ -246,6 +245,9 @@ public class OnlineIndexer implements AutoCloseable {
         this.recordsRange = computeRecordsRange();
         timeOfLastProgressLogMillis = System.currentTimeMillis();
         totalRecordsScanned = new AtomicLong(0);
+
+        this.common = new OnlineIndexerCommon(useSynchronizedSession,runner,index
+        );
     }
 
     /**
@@ -405,7 +407,7 @@ public class OnlineIndexer implements AutoCloseable {
         List<Object> onlineIndexerLogMessageKeyValues = new ArrayList<>(Arrays.asList(
                 LogMessageKeys.INDEX_NAME, index.getName(),
                 LogMessageKeys.INDEX_VERSION, index.getLastModifiedVersion(),
-                LogMessageKeys.INDEXER_ID, onlineIndexerId));
+                LogMessageKeys.INDEXER_ID, common.getUuid()));
         if (additionalLogMessageKeyValues != null) {
             onlineIndexerLogMessageKeyValues.addAll(additionalLogMessageKeyValues);
         }
@@ -848,7 +850,7 @@ public class OnlineIndexer implements AutoCloseable {
                             LogMessageKeys.END_TUPLE, endTuple,
                             LogMessageKeys.REAL_END, realEnd,
                             LogMessageKeys.RECORDS_SCANNED, totalRecordsScanned.get()),
-                            LogMessageKeys.INDEXER_ID, onlineIndexerId);
+                            LogMessageKeys.INDEXER_ID, common.getUuid());
             timeOfLastProgressLogMillis = System.currentTimeMillis();
         }
     }
@@ -1590,7 +1592,7 @@ public class OnlineIndexer implements AutoCloseable {
                                         subspaceProvider.logKey(), subspaceProvider,
                                         LogMessageKeys.NEXT_CONTINUATION, retCont,
                                         LogMessageKeys.RECORDS_SCANNED, totalRecordsScanned.get()),
-                                        LogMessageKeys.INDEXER_ID, onlineIndexerId);
+                                        LogMessageKeys.INDEXER_ID, common.getUuid());
                                 timeOfLastProgressLogMillis = System.currentTimeMillis();
                             }
                             if (retCont == null) {
