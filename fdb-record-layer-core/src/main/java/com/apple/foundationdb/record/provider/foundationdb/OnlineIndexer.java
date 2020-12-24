@@ -246,8 +246,13 @@ public class OnlineIndexer implements AutoCloseable {
         timeOfLastProgressLogMillis = System.currentTimeMillis();
         totalRecordsScanned = new AtomicLong(0);
 
-        this.common = new OnlineIndexerCommon(useSynchronizedSession,runner,index
-        );
+        this.common = new OnlineIndexerCommon(runner, recordStoreBuilder,
+                index, recordTypes, configLoader, config,
+                syntheticIndex,
+                indexStatePrecondition.getCommonVal(),
+                trackProgress,
+                useSynchronizedSession
+            );
     }
 
     /**
@@ -376,6 +381,7 @@ public class OnlineIndexer implements AutoCloseable {
 
     @Override
     public void close() {
+        common.close();
         runner.close();
         if (synchronizedSessionRunner != null) {
             synchronizedSessionRunner.close();
@@ -2862,39 +2868,45 @@ public class OnlineIndexer implements AutoCloseable {
         /**
          * Only build if the index is disabled.
          */
-        BUILD_IF_DISABLED(false),
+        BUILD_IF_DISABLED(false, OnlineIndexerCommon.IndexStatePrecondition.BUILD_IF_DISABLED),
         /**
          * Build if the index is disabled; Continue build if the index is write-only.
          * <p>
          * Recommended. This should be sufficient if current index data is not corrupted.
          * </p>
          */
-        BUILD_IF_DISABLED_CONTINUE_BUILD_IF_WRITE_ONLY(true),
+        BUILD_IF_DISABLED_CONTINUE_BUILD_IF_WRITE_ONLY(true, OnlineIndexerCommon.IndexStatePrecondition.BUILD_IF_DISABLED_CONTINUE_BUILD_IF_WRITE_ONLY),
         /**
          * Build if the index is disabled; Rebuild if the index is write-only.
          */
-        BUILD_IF_DISABLED_REBUILD_IF_WRITE_ONLY(false),
+        BUILD_IF_DISABLED_REBUILD_IF_WRITE_ONLY(false, OnlineIndexerCommon.IndexStatePrecondition.BUILD_IF_DISABLED_REBUILD_IF_WRITE_ONLY),
         /**
          * Rebuild the index anyway, no matter it it disabled or write-only or readable.
          */
-        FORCE_BUILD(false),
+        FORCE_BUILD(false, OnlineIndexerCommon.IndexStatePrecondition.FORCE_BUILD),
         /**
          * Error if the index is disabled, or continue to build if the index is write only. To use this option to build
          * an index, one should mark the index as write-only and clear existing index entries before building. This
          * option is provided to make {@link #buildIndexAsync()} (or its variations) behave same as what it did before
          * version 2.8.90.0, which is not recommended. {@link #BUILD_IF_DISABLED_CONTINUE_BUILD_IF_WRITE_ONLY} should be adopted instead.
          */
-        ERROR_IF_DISABLED_CONTINUE_IF_WRITE_ONLY(true),
+        ERROR_IF_DISABLED_CONTINUE_IF_WRITE_ONLY(true, OnlineIndexerCommon.IndexStatePrecondition.ERROR_IF_DISABLED_CONTINUE_IF_WRITE_ONLY),
         ;
 
         private boolean continueIfWriteOnly;
+        private OnlineIndexerCommon.IndexStatePrecondition commonVal;
 
-        IndexStatePrecondition(boolean continueIfWriteOnly) {
+        IndexStatePrecondition(boolean continueIfWriteOnly, OnlineIndexerCommon.IndexStatePrecondition commonVal) {
             this.continueIfWriteOnly = continueIfWriteOnly;
+            this.commonVal = commonVal;
         }
 
         public boolean isContinueIfWriteOnly() {
             return continueIfWriteOnly;
+        }
+
+        public OnlineIndexerCommon.IndexStatePrecondition getCommonVal() {
+            return commonVal;
         }
     }
 }
