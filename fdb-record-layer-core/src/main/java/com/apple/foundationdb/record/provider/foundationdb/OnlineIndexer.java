@@ -26,7 +26,6 @@ import com.apple.foundationdb.MutationType;
 import com.apple.foundationdb.Range;
 import com.apple.foundationdb.ReadTransactionContext;
 import com.apple.foundationdb.Transaction;
-import com.apple.foundationdb.TransactionContext;
 import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.async.AsyncIterator;
 import com.apple.foundationdb.async.AsyncUtil;
@@ -34,7 +33,6 @@ import com.apple.foundationdb.async.MoreAsyncUtil;
 import com.apple.foundationdb.async.RangeSet;
 import com.apple.foundationdb.record.EndpointType;
 import com.apple.foundationdb.record.ExecuteProperties;
-import com.apple.foundationdb.record.IndexScanType;
 import com.apple.foundationdb.record.IndexState;
 import com.apple.foundationdb.record.IsolationLevel;
 import com.apple.foundationdb.record.RecordCoreException;
@@ -49,7 +47,6 @@ import com.apple.foundationdb.record.TupleRange;
 import com.apple.foundationdb.record.logging.KeyValueLogMessage;
 import com.apple.foundationdb.record.logging.LogMessageKeys;
 import com.apple.foundationdb.record.metadata.Index;
-import com.apple.foundationdb.record.metadata.IndexTypes;
 import com.apple.foundationdb.record.metadata.Key;
 import com.apple.foundationdb.record.metadata.MetaDataException;
 import com.apple.foundationdb.record.metadata.RecordType;
@@ -79,7 +76,6 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -91,7 +87,6 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Function;
-import java.util.function.Supplier;
 
 /**
  * Builds an index online, i.e., concurrently with other database operations. In order to minimize
@@ -181,10 +176,9 @@ public class OnlineIndexer implements AutoCloseable {
     private static final Object INDEX_BUILD_LOCK_KEY = 0L;
     private static final Object INDEX_BUILD_SCANNED_RECORDS = 1L;
 
-    @Nonnull private OnlineIndexerCommon common;
+    @Nonnull private final OnlineIndexerCommon common;
 
     @Nonnull private final FDBDatabaseRunner runner;
-    @Nullable private SynchronizedSessionRunner synchronizedSessionRunner;
     @Nonnull private final FDBRecordStore.Builder recordStoreBuilder;
     @Nonnull private final Index index;
     @Nonnull private final Collection<RecordType> recordTypes;
@@ -234,7 +228,7 @@ public class OnlineIndexer implements AutoCloseable {
         this.recordTypes = recordTypes;
         this.configLoader = configLoader;
         this.config = config;
-        this.limit = config.maxLimit;
+        this.limit = config.getMaxLimit();
         this.syntheticIndex = syntheticIndex;
         this.indexStatePrecondition = indexStatePrecondition;
         this.useSynchronizedSession = useSynchronizedSession;
@@ -382,10 +376,6 @@ public class OnlineIndexer implements AutoCloseable {
     @Override
     public void close() {
         common.close();
-        runner.close();
-        if (synchronizedSessionRunner != null) {
-            synchronizedSessionRunner.close();
-        }
     }
 
     /**
@@ -1188,57 +1178,35 @@ public class OnlineIndexer implements AutoCloseable {
     @VisibleForTesting
     @Nonnull
     CompletableFuture<Void> buildIndexAsync(boolean markReadable) {
-        KeyValueLogMessage message = KeyValueLogMessage.build("build index online",
-                LogMessageKeys.SHOULD_MARK_READABLE, markReadable);
-        final CompletableFuture<Void> buildIndexAsyncFuture;
-        if (useSynchronizedSession) {
-            buildIndexAsyncFuture = runner
-                    .runAsync(context -> openRecordStore(context).thenApply(store -> indexBuildLockSubspace(store, index)))
-                    .thenCompose(lockSubspace -> runner.startSynchronizedSessionAsync(lockSubspace, leaseLengthMills))
-                    .thenCompose(synchronizedRunner -> {
-                        message.addKeyAndValue(LogMessageKeys.SESSION_ID, synchronizedRunner.getSessionId());
-                        return runWithSynchronizedRunnerAndEndSession(synchronizedRunner,
-                                () -> handleStateAndDoBuildIndexAsync(markReadable, message));
-                    });
+
+        if (indexFromIndex.isActive()) {
+            return buildIndexAsyncByIndex(markReadable);
         } else {
-            message.addKeyAndValue(LogMessageKeys.SESSION_ID, "none");
-            synchronizedSessionRunner = null;
-            buildIndexAsyncFuture = handleStateAndDoBuildIndexAsync(markReadable, message);
+            return buildIndexAsyncByRecords(markReadable);
         }
-        return buildIndexAsyncFuture.whenComplete((vignore, ex) -> {
-            if (LOGGER.isWarnEnabled() && (ex != null)) {
-                message.addKeyAndValue(LogMessageKeys.RESULT, "failure");
-                LOGGER.warn(message.toString(), ex);
-            } else if (LOGGER.isInfoEnabled()) {
-                message.addKeyAndValue(LogMessageKeys.RESULT, "success");
-                LOGGER.info(message.toString());
-            }
-        });
     }
 
-    private <T> CompletableFuture<T> runWithSynchronizedRunnerAndEndSession(
-            @Nonnull SynchronizedSessionRunner newSynchronizedRunner, @Nonnull Supplier<CompletableFuture<T>> runnable) {
-        final SynchronizedSessionRunner currentSynchronizedRunner1 = this.synchronizedSessionRunner;
-        if (currentSynchronizedRunner1 == null) {
-            this.synchronizedSessionRunner = newSynchronizedRunner;
-            return MoreAsyncUtil.composeWhenComplete(runnable.get(), (result, ex) -> {
-                final SynchronizedSessionRunner currentSynchronizedRunner2 = this.synchronizedSessionRunner;
-                if (newSynchronizedRunner.equals(currentSynchronizedRunner2)) {
-                    this.synchronizedSessionRunner = null;
-                } else {
-                    LOGGER.warn(KeyValueLogMessage.of("synchronizedSessionRunner was modified during the run",
-                            LogMessageKeys.SESSION_ID, newSynchronizedRunner.getSessionId(),
-                            LogMessageKeys.INDEXER_SESSION_ID, currentSynchronizedRunner2 == null ? null : currentSynchronizedRunner2.getSessionId()));
-                }
-                return newSynchronizedRunner.endSessionAsync();
-            }, getRunner().getDatabase()::mapAsyncToSyncException);
-        } else {
-            return newSynchronizedRunner.endSessionAsync().thenApply(vignore -> {
-                throw new RecordCoreException("another synchronized session is running on the indexer",
-                        LogMessageKeys.SESSION_ID, newSynchronizedRunner.getSessionId(),
-                        LogMessageKeys.INDEXER_SESSION_ID, currentSynchronizedRunner1.getSessionId());
-            });
-        }
+    @Nonnull
+    CompletableFuture<Void> buildIndexAsyncByIndex(boolean markReadable) {
+        OnlineIndexerBase indexer = new OnlineIndexerByIndex(common, indexFromIndex);
+        return AsyncUtil.composeHandle( indexer.buildIndexAsync(markReadable, leaseLengthMills),
+                (ignore, ex) -> {
+                    if (ex == null) {
+                        return AsyncUtil.DONE;
+                    }
+                    if (indexFromIndex.isAllowRecordScan() &&
+                            (ex.getCause() instanceof OnlineIndexerException)) {
+                        // fallback to a records scan
+                        return buildIndexAsyncByRecords(markReadable);
+                    }
+                    throw FDBExceptions.wrapException(ex);
+                });
+    }
+
+    @Nonnull
+    CompletableFuture<Void> buildIndexAsyncByRecords(boolean markReadable) {
+        OnlineIndexerBase indexer = new OnlineIndexerByRecords(common);
+        return indexer.buildIndexAsync(markReadable, leaseLengthMills);
     }
 
     @Nonnull
@@ -1250,99 +1218,6 @@ public class OnlineIndexer implements AutoCloseable {
     protected static Subspace indexBuildScannedRecordsSubspace(@Nonnull FDBRecordStoreBase<?> store, @Nonnull Index index) {
         return store.getUntypedRecordStore().indexBuildSubspace(index)
                 .subspace(Tuple.from(INDEX_BUILD_SCANNED_RECORDS));
-    }
-
-    @Nonnull
-    private CompletableFuture<Void> handleStateAndDoBuildIndexAsync(boolean markReadable, KeyValueLogMessage message) {
-        message.addKeyAndValue(LogMessageKeys.INDEX_STATE_PRECONDITION, indexStatePrecondition);
-        if (indexStatePrecondition == IndexStatePrecondition.ERROR_IF_DISABLED_CONTINUE_IF_WRITE_ONLY) {
-            message.addKeyAndValue(LogMessageKeys.SHOULD_BUILD_INDEX, true);
-            return doBuildIndexAsync(markReadable);
-        }
-        return getRunner().runAsync(context -> openRecordStore(context).thenCompose(store -> {
-            IndexState indexState = store.getIndexState(index);
-            boolean shouldBuild = shouldBuildIndex(indexState, indexStatePrecondition);
-            message.addKeyAndValue(LogMessageKeys.INITIAL_INDEX_STATE, indexState);
-            message.addKeyAndValue(LogMessageKeys.SHOULD_BUILD_INDEX, shouldBuild);
-            if (shouldBuild) {
-                boolean shouldClear = shouldClearExistingIndexEntries(indexState, indexStatePrecondition);
-                message.addKeyAndValue(LogMessageKeys.SHOULD_CLEAR_EXISTING_DATA, shouldClear);
-                if (shouldClear) {
-                    store.clearIndexData(index);
-                }
-                return store.markIndexWriteOnly(index).thenApply(vignore -> true);
-            } else {
-                return AsyncUtil.READY_FALSE;
-            }
-        })).thenCompose(shouldBuild -> shouldBuild ? doBuildIndexAsync(markReadable) : AsyncUtil.DONE);
-    }
-
-    @SuppressWarnings("fallthrough")
-    private boolean shouldBuildIndex(@Nonnull IndexState indexState, @Nonnull IndexStatePrecondition indexStatePrecondition) {
-        switch (indexStatePrecondition) {
-            case BUILD_IF_DISABLED:
-                return indexState == IndexState.DISABLED;
-
-            case BUILD_IF_DISABLED_CONTINUE_BUILD_IF_WRITE_ONLY:
-            case BUILD_IF_DISABLED_REBUILD_IF_WRITE_ONLY:
-                return indexState == IndexState.DISABLED || indexState == IndexState.WRITE_ONLY;
-
-            case FORCE_BUILD:
-                return true;
-
-            default:
-                throw new RecordCoreException("unknown index state precondition " + indexStatePrecondition);
-        }
-    }
-
-    private boolean shouldClearExistingIndexEntries(@Nonnull IndexState indexState,
-                                                    @Nonnull IndexStatePrecondition indexStatePrecondition) {
-        // If the index state is DISABLED, it is expected that there is no existing index entry. But we would like
-        // to clear it anyway to play safe.
-        return !(indexState == IndexState.WRITE_ONLY && indexStatePrecondition.isContinueIfWriteOnly());
-    }
-
-    @Nonnull
-    private CompletableFuture<Void> buildIndexFromRecordsAsync() {
-        return buildEndpoints().thenCompose(tupleRange -> {
-            if (tupleRange != null) {
-                return buildRange(Key.Evaluated.fromTuple(tupleRange.getLow()), Key.Evaluated.fromTuple(tupleRange.getHigh()));
-            } else {
-                return CompletableFuture.completedFuture(null);
-            }
-        });
-    }
-
-    @Nonnull
-    private CompletableFuture<Void> doBuildIndexAsync(boolean markReadable) {
-        CompletableFuture<Void> buildFuture;
-        if (indexFromIndex.isActive()) {
-            buildFuture = AsyncUtil.composeHandle(
-                    buildIndexFromIndexAsync(),
-                    (ignore, ex) -> {
-                        if (ex != null) {
-                            if (indexFromIndex.isAllowRecordScan() &&
-                                    (ex instanceof OnlineIndexerException)) {
-                                // fallback to a records scan
-                                return buildIndexFromRecordsAsync();
-                            }
-                            throw FDBExceptions.wrapException(ex);
-                        }
-                        return AsyncUtil.DONE;
-                    }
-            );
-        } else {
-            buildFuture = buildIndexFromRecordsAsync();
-        }
-
-        if (markReadable) {
-            return buildFuture.thenCompose(vignore ->
-                    getRunner().runAsync(context -> openRecordStore(context)
-                            .thenCompose(store -> store.markIndexReadable(index))
-                            .thenApply(ignore -> null)));
-        } else {
-            return buildFuture;
-        }
     }
 
     /**
@@ -1514,205 +1389,7 @@ public class OnlineIndexer implements AutoCloseable {
     }
 
     private FDBDatabaseRunner getRunner() {
-        if (synchronizedSessionRunner != null) {
-            return synchronizedSessionRunner;
-        } else {
-            return runner;
-        }
-    }
-
-    @Nonnull
-    private CompletableFuture<Void> buildIndexFromIndexMarkBuilt(Subspace subspace) {
-        // zz 2.1 - mark built
-        // Grand Finale - after fully building the index, remove all missing ranges in one gulp
-        return getRunner().runAsync(context -> {
-            RangeSet rangeSet = new RangeSet(subspace.subspace(Tuple.from(FDBRecordStore.INDEX_RANGE_SPACE_KEY, index.getSubspaceKey())));
-            TransactionContext tc = context.ensureActive();
-            return rangeSet.insertRange(tc, null, null).thenApply(bignore -> null);
-        });
-    }
-
-    private void buildIndexFromIndexThrowEx(@Nonnull String msg) {
-        throw new OnlineIndexerException(msg);
-    }
-
-    @Nonnull
-    private CompletableFuture<Void> buildIndexFromIndexAsync() {
-        // zz 1 - runner
-        return getRunner().runAsync(context -> openRecordStore(context)
-                .thenCompose( store -> {
-                    // first verify that both src and tgt are of a single, similar, type
-                    final RecordMetaData metaData = store.getRecordMetaData();
-                    final Index srcIndex = metaData.getIndex(Objects.requireNonNull(indexFromIndex.getSourceIndex()));
-                    final Collection<RecordType> srcRecordTypes = metaData.recordTypesForIndex(srcIndex);
-
-                    if ( syntheticIndex ||
-                            recordTypes.size() != 1) {
-                        buildIndexFromIndexThrowEx("IndexFromIndex: tgt cannot be scanned from index");
-                    }
-                    if (srcRecordTypes.size() != 1 ||
-                            srcIndex.getRootExpression().createsDuplicates() ||
-                            ! srcIndex.getType().equals(IndexTypes.VALUE) ||
-                            ! recordTypes.equals(srcRecordTypes) ) {
-                        buildIndexFromIndexThrowEx("IndexFromIndex: src cannot be used for this tgt");
-                    }
-
-                    return context.getReadVersionAsync()
-                            .thenCompose(vignore -> {
-                                SubspaceProvider subspaceProvider = recordStoreBuilder.getSubspaceProvider();
-                                // zz 2 - subspace
-                                return subspaceProvider.getSubspaceAsync(context)
-                                        .thenCompose(subspace ->
-                                                buildIndexFromIndex(subspaceProvider, subspace)
-                                                        .thenCompose(vignore2 -> buildIndexFromIndexMarkBuilt(subspace)
-                                                        ));
-                            });
-                }));
-    }
-
-    @Nonnull
-    private CompletableFuture<Void> buildIndexFromIndex(SubspaceProvider subspaceProvider, @Nonnull Subspace subspace) {
-        AtomicReference<byte[]> nextCont = new AtomicReference<>();
-
-        // zz 3 while true -> runner/store -> build chunk
-        return AsyncUtil.whileTrue(() -> {
-            byte [] cont = nextCont.get();
-            final List<Object> additionalLogMessageKeyValues = Arrays.asList(LogMessageKeys.CALLING_METHOD, "buildIndexFromIndex",
-                    LogMessageKeys.NEXT_CONTINUATION, cont == null ? "" : cont);
-
-            // zz 4 - buildAsync
-            // apparently, buildAsync=buildAndCommitWithRetry
-            return buildAsync( (store, recordsScanned) -> buildIndexFromIndexRange(store, cont, recordsScanned),
-                    true,
-                    additionalLogMessageKeyValues)
-                    .handle((retCont, ex) -> {
-                        // zz 4.1 - handle range
-                        if (ex == null) {
-                            if (LOGGER.isInfoEnabled() &&
-                                    (config.progressLogIntervalMillis > 0 &&
-                                    System.currentTimeMillis() - timeOfLastProgressLogMillis > config.progressLogIntervalMillis) ||
-                                    config.progressLogIntervalMillis == 0) {
-                                LOGGER.info(KeyValueLogMessage.of("Built Range",
-                                        LogMessageKeys.INDEX_NAME, index.getName(),
-                                        LogMessageKeys.INDEX_VERSION, index.getLastModifiedVersion(),
-                                        subspaceProvider.logKey(), subspaceProvider,
-                                        LogMessageKeys.NEXT_CONTINUATION, retCont,
-                                        LogMessageKeys.RECORDS_SCANNED, totalRecordsScanned.get()),
-                                        LogMessageKeys.INDEXER_ID, common.getUuid());
-                                timeOfLastProgressLogMillis = System.currentTimeMillis();
-                            }
-                            if (retCont == null) {
-                                return AsyncUtil.READY_FALSE;
-                            }
-                            nextCont.set(retCont); // continuation
-                            long toWait = (config.recordsPerSecond == UNLIMITED) ? 0 : 1000 * limit / config.recordsPerSecond;
-                            // Note that if the database slows down under load, the index build also naturally decreases
-                            // the amount of work it actually gets done per second
-                            return MoreAsyncUtil.delayedFuture(toWait, TimeUnit.MILLISECONDS).thenApply(vignore3 -> true);
-                        }
-                        final RuntimeException unwrappedEx = getRunner().getDatabase().mapAsyncToSyncException(ex);
-                        if (LOGGER.isInfoEnabled()) {
-                            LOGGER.info(KeyValueLogMessage.of("possibly non-fatal error encountered building range",
-                                    LogMessageKeys.NEXT_CONTINUATION, nextCont,
-                                    LogMessageKeys.SUBSPACE, ByteArrayUtil2.loggable(subspace.pack())), ex);
-                        }
-                        throw unwrappedEx;
-                    })
-                    .thenCompose(Function.identity());
-        }, getRunner().getExecutor());
-    }
-
-    @Nonnull
-    private CompletableFuture<byte[]> buildIndexFromIndexRange(@Nonnull FDBRecordStore store, byte[] cont, @Nonnull AtomicLong recordsScanned) {
-        // zz 5  - buildRangeOnly
-
-        final Subspace scannedRecordsSubspace = indexBuildScannedRecordsSubspace(store, index);
-        final RecordMetaDataProvider recordMetaDataProvider = recordStoreBuilder.getMetaDataProvider();
-        if ( recordMetaDataProvider == null ||
-                !store.getRecordMetaData().equals(recordMetaDataProvider.getRecordMetaData())) {
-            throw new MetaDataException("Store does not have the same metadata");
-        }
-        final String srcIndex = indexFromIndex.getSourceIndex();
-
-        final IndexMaintainer maintainer = store.getIndexMaintainer(index);
-        if (! maintainer.isIdempotent() ) {
-            // idempotence - We could have verified it at the first iteration only, but the repeating checks seem harmless
-            buildIndexFromIndexThrowEx("IndexFromIndex: tgt is not idempotent");
-        }
-        if (! store.isIndexReadable(srcIndex)) {
-            // readability - This method shouldn't block if one has already opened the record store (as we did)
-            buildIndexFromIndexThrowEx("IndexFromIndex: src is not readable");
-        }
-
-        final ExecuteProperties.Builder executeProperties = ExecuteProperties.newBuilder()
-                .setIsolationLevel(IsolationLevel.SNAPSHOT)
-                .setReturnedRowLimit(limit); // always respectLimit in this path
-        final ScanProperties scanProperties = new ScanProperties(executeProperties.build());
-
-        RecordCursor<FDBIndexedRecord<Message>> cursor =
-                store.scanIndexRecords(srcIndex, IndexScanType.BY_VALUE, TupleRange.ALL, cont, scanProperties);
-
-        final AtomicLong recordsScannedCounter = new AtomicLong();
-        final AtomicReference<RecordCursorResult<FDBIndexedRecord<Message>>> lastResult = new AtomicReference<>(RecordCursorResult.exhausted());
-        final FDBRecordContext context = store.getContext();
-        final AtomicBoolean isEmpty = new AtomicBoolean(true);
-        final FDBStoreTimer timer = getRunner().getTimer();
-
-        return AsyncUtil.whileTrue(() -> cursor.onNext().thenCompose(result -> {
-            // zz 6 - handle a record
-            if (!result.hasNext()) {
-                // end of the cursor list
-                if (timer != null) {
-                    timer.increment(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RANGES_BY_COUNT);
-                }
-                lastResult.set(result);
-                return AsyncUtil.READY_FALSE;
-            }
-
-            final FDBIndexedRecord<Message> msg = result.get();
-            assert msg != null;
-            final FDBStoredRecord<Message> rec = msg.getStoredRecord();
-            isEmpty.set(false);
-            if (timer != null) {
-                timer.increment(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RECORDS_SCANNED);
-            }
-            recordsScannedCounter.incrementAndGet();
-            if (!recordTypes.contains(rec.getRecordType())) {
-                // This should never happen! (yet)
-                return AsyncUtil.READY_TRUE;
-            }
-            // add this index to the transaction
-            store.addRecordReadConflict(rec.getPrimaryKey());
-            if (timer != null) {
-                timer.increment(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RECORDS_INDEXED);
-            }
-
-            // Note that synthetic plan is not allowed here
-            final CompletableFuture<Void> updateMaintainer = maintainer.update(null, rec);
-
-            return updateMaintainer.thenCompose(vignore ->
-                    context.getApproximateTransactionSize().thenApply(size -> {
-                        if (size >= config.getMaxWriteLimitBytes()) {
-                            // the transaction becomes too big - stop iterating
-                            if (timer != null) {
-                                timer.increment(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RANGES_BY_SIZE);
-                            }
-                            lastResult.set(result);
-                            return false;
-                        }
-                        return true;
-                    }));
-        }), cursor.getExecutor()
-        ).thenCompose(vignore -> {
-            long recordsScannedInTransaction = recordsScannedCounter.get();
-            recordsScanned.addAndGet(recordsScannedInTransaction);
-            if (trackProgress) {
-                store.context.ensureActive().mutate(MutationType.ADD, scannedRecordsSubspace.getKey(),
-                        FDBRecordStore.encodeRecordCount(recordsScannedInTransaction));
-            }
-            final byte[] retCont = isEmpty.get() ? null : lastResult.get().getContinuation().toBytes();
-            return CompletableFuture.completedFuture( retCont );
-        });
+        return runner;
     }
 
     /**

@@ -63,11 +63,6 @@ public abstract class OnlineIndexerBase {
         this.totalRecordsScanned = new AtomicLong(0);
     }
 
-    @SuppressWarnings("squid:S1452")
-    private CompletableFuture<FDBRecordStore> openRecordStore(@Nonnull FDBRecordContext context) {
-        return common.getRecordStoreBuilder().copyBuilder().setContext(context).openAsync();
-    }
-
     protected FDBDatabaseRunner getRunner() {
         SynchronizedSessionRunner synchronizedSessionRunner = common.getSynchronizedSessionRunner();
         if (synchronizedSessionRunner != null) {
@@ -85,7 +80,7 @@ public abstract class OnlineIndexerBase {
         Index index = common.getIndex();
         if (common.isUseSynchronizedSession()) {
             buildIndexAsyncFuture = runner
-                    .runAsync(context -> openRecordStore(context).thenApply(store -> OnlineIndexerCommon.indexBuildLockSubspace(store, index)))
+                    .runAsync(context -> common.openRecordStore(context).thenApply(store -> OnlineIndexerCommon.indexBuildLockSubspace(store, index)))
                     .thenCompose(lockSubspace -> runner.startSynchronizedSessionAsync(lockSubspace, leaseLengthMills))
                     .thenCompose(synchronizedRunner -> {
                         message.addKeyAndValue(LogMessageKeys.SESSION_ID, synchronizedRunner.getSessionId());
@@ -143,7 +138,7 @@ public abstract class OnlineIndexerBase {
             return doBuildIndexAsync(markReadable);
         }
         final Index index = common.getIndex();
-        return getRunner().runAsync(context -> openRecordStore(context).thenCompose(store -> {
+        return getRunner().runAsync(context -> common.openRecordStore(context).thenCompose(store -> {
             IndexState indexState = store.getIndexState(index);
             boolean shouldBuild = shouldBuildIndex(indexState, indexStatePrecondition);
             message.addKeyAndValue(LogMessageKeys.INITIAL_INDEX_STATE, indexState);
@@ -192,7 +187,7 @@ public abstract class OnlineIndexerBase {
 
         if (markReadable) {
             return buildFuture.thenCompose(vignore ->
-                    getRunner().runAsync(context -> openRecordStore(context)
+                    getRunner().runAsync(context -> common.openRecordStore(context)
                             .thenCompose(store -> store.markIndexReadable(common.getIndex()))
                             .thenApply(ignore -> null)));
         } else {
