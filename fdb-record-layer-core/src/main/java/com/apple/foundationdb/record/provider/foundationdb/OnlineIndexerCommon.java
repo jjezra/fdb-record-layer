@@ -31,6 +31,7 @@ import javax.annotation.Nullable;
 import java.util.Collection;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 
 /**
@@ -45,6 +46,7 @@ public class OnlineIndexerCommon {
     @Nonnull private final FDBRecordStore.Builder recordStoreBuilder;
     @Nonnull private final Index index;
     @Nonnull private final IndexStatePrecondition indexStatePrecondition;
+    @Nonnull private final AtomicLong totalRecordsScanned;
 
     private final boolean useSynchronizedSession;
     private final boolean syntheticIndex;
@@ -60,6 +62,7 @@ public class OnlineIndexerCommon {
 
     private static final Object INDEX_BUILD_LOCK_KEY = 0L;
     private static final Object INDEX_BUILD_SCANNED_RECORDS = 1L;
+
     /**
      * Constant indicating that there should be no limit to some usually limited operation.
      */
@@ -85,6 +88,8 @@ public class OnlineIndexerCommon {
         this.indexStatePrecondition = indexStatePrecondition;
         this.trackProgress = trackProgress;
         this.recordStoreBuilder = recordStoreBuilder;
+
+        this.totalRecordsScanned = new AtomicLong(0);
     }
 
     public UUID getUuid() {
@@ -97,7 +102,7 @@ public class OnlineIndexerCommon {
 
     @Nonnull
     public FDBDatabaseRunner getRunner() {
-        return runner;
+        return synchronizedSessionRunner == null ? runner : synchronizedSessionRunner;
     }
 
     @Nonnull
@@ -127,13 +132,6 @@ public class OnlineIndexerCommon {
         this.synchronizedSessionRunner = synchronizedSessionRunner;
     }
 
-    public void close() {
-        runner.close();
-        if (synchronizedSessionRunner != null) {
-            synchronizedSessionRunner.close();
-        }
-    }
-
     @Nonnull
     public IndexStatePrecondition getIndexStatePrecondition() {
         return indexStatePrecondition;
@@ -150,11 +148,31 @@ public class OnlineIndexerCommon {
                 .subspace(Tuple.from(INDEX_BUILD_SCANNED_RECORDS));
     }
 
+    @Nonnull
+    public AtomicLong getTotalRecordsScanned() {
+        return totalRecordsScanned;
+    }
+
+    public boolean loadConfig() {
+
+        if (configLoader == null) {
+            return false;
+        }
+        config = configLoader.apply(config);
+        return true;
+    }
+
     @SuppressWarnings("squid:S1452")
     public CompletableFuture<FDBRecordStore> openRecordStore(@Nonnull FDBRecordContext context) {
         return recordStoreBuilder.copyBuilder().setContext(context).openAsync();
     }
 
+    public void close() {
+        runner.close();
+        if (synchronizedSessionRunner != null) {
+            synchronizedSessionRunner.close();
+        }
+    }
 
     /**
      * To avoid cyclic imports, this is the internal version of {@link OnlineIndexer.IndexStatePrecondition}.
@@ -168,9 +186,11 @@ public class OnlineIndexerCommon {
         ;
 
         private boolean continueIfWriteOnly;
+
         IndexStatePrecondition(boolean continueIfWriteOnly) {
             this.continueIfWriteOnly = continueIfWriteOnly;
         }
+
         public boolean isContinueIfWriteOnly() {
             return continueIfWriteOnly;
         }

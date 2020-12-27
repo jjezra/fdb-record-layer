@@ -101,7 +101,7 @@ public class OnlineIndexerByRecords extends OnlineIndexerBase {
                     LogMessageKeys.START_TUPLE, startTuple,
                     LogMessageKeys.END_TUPLE, endTuple,
                     LogMessageKeys.REAL_END, realEnd,
-                    LogMessageKeys.RECORDS_SCANNED, totalRecordsScanned.get()),
+                    LogMessageKeys.RECORDS_SCANNED, common.getTotalRecordsScanned().get()),
                     LogMessageKeys.INDEXER_ID, common.getUuid());
         }
     }

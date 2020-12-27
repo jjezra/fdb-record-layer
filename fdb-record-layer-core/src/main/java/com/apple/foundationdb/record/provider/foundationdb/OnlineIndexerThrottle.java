@@ -60,7 +60,6 @@ public class OnlineIndexerThrottle {
 
     @Nonnull private static final Logger LOGGER = LoggerFactory.getLogger(OnlineIndexerThrottle.class);
     @Nonnull private final OnlineIndexerCommon common;
-    @Nonnull private final FDBDatabaseRunner runner;
     @Nonnull private final AtomicLong totalRecordsScanned;
 
     private int limit;
@@ -81,13 +80,10 @@ public class OnlineIndexerThrottle {
      */
     private int successCount = 0;
 
-    OnlineIndexerThrottle(@Nonnull AtomicLong totalRecordsScanned,
-                          @Nonnull OnlineIndexerCommon common,
-                          @Nonnull FDBDatabaseRunner runner) {
+    OnlineIndexerThrottle(@Nonnull OnlineIndexerCommon common) {
 
-        this.totalRecordsScanned = totalRecordsScanned;
         this.common = common;
-        this.runner = runner;
+        this.totalRecordsScanned = common.getTotalRecordsScanned();
         this.limit = common.config.getMaxLimit();
     }
 
@@ -127,8 +123,7 @@ public class OnlineIndexerThrottle {
 
     private void loadConfig() {
         configLoaderInvocationCount++;
-        if (common.configLoader != null) {
-            common.config = common.configLoader.apply(common.config);
+        if (common.loadConfig()) {
             final int maxLimit = common.config.getMaxLimit();
             if (limit > maxLimit) {
                 if (LOGGER.isInfoEnabled()) {
@@ -136,7 +131,7 @@ public class OnlineIndexerThrottle {
                             KeyValueLogMessage.build("Decreasing the limit to the new maxLimit.",
                                     LogMessageKeys.INDEX_NAME, common.getIndex().getName(),
                                     LogMessageKeys.LIMIT, limit,
-                                    LogMessageKeys.MAX_LIMIT, common.config.getMaxLimit()).toString());
+                                    LogMessageKeys.MAX_LIMIT, maxLimit).toString());
                 }
                 limit = maxLimit;
             }
@@ -223,7 +218,7 @@ public class OnlineIndexerThrottle {
         AsyncUtil.whileTrue(() -> {
             loadConfig();
             final Index index = common.getIndex();
-            return runner.runAsync(context -> common.openRecordStore(context).thenCompose(store -> {
+            return common.getRunner().runAsync(context -> common.openRecordStore(context).thenCompose(store -> {
                 IndexState indexState = store.getIndexState(index);
                 if (indexState != IndexState.WRITE_ONLY) {
                     throw new RecordCoreStorageException("Attempted to build non-write-only index",
@@ -260,7 +255,7 @@ public class OnlineIndexerThrottle {
                     }
                 }
             }).thenCompose(Function.identity());
-        }, runner.getExecutor()).whenComplete((vignore, e) -> {
+        }, common.getRunner().getExecutor()).whenComplete((vignore, e) -> {
             if (e != null) {
                 // Just update ret and ignore the returned future.
                 completeExceptionally(ret, e, onlineIndexerLogMessageKeyValues);
@@ -273,7 +268,7 @@ public class OnlineIndexerThrottle {
         if (e instanceof LoggableException) {
             ((LoggableException)e).addLogInfo(additionalLogMessageKeyValues.toArray());
         }
-        ret.completeExceptionally(runner.getDatabase().mapAsyncToSyncException(e));
+        ret.completeExceptionally(common.getRunner().getDatabase().mapAsyncToSyncException(e));
         return AsyncUtil.READY_FALSE;
     }
 

@@ -177,6 +177,7 @@ public class OnlineIndexer implements AutoCloseable {
     private static final Object INDEX_BUILD_SCANNED_RECORDS = 1L;
 
     @Nonnull private final OnlineIndexerCommon common;
+    @Nullable private OnlineIndexerBase indexScanner = null;
 
     @Nonnull private final FDBDatabaseRunner runner;
     @Nonnull private final FDBRecordStore.Builder recordStoreBuilder;
@@ -190,7 +191,6 @@ public class OnlineIndexer implements AutoCloseable {
      */
     private int limit;
     @Nonnull private final Function<Config, Config> configLoader;
-    @Nonnull private Config config;
     private int configLoaderInvocationCount = 0;
     @Nonnull private final IndexFromIndexPolicy indexFromIndex;
     /**
@@ -202,12 +202,9 @@ public class OnlineIndexer implements AutoCloseable {
      * The total number of records scanned in the build.
      * @see Builder#setProgressLogIntervalMillis(long)
      */
-    private AtomicLong totalRecordsScanned;
 
     private final boolean syntheticIndex;
 
-    @Nonnull private final IndexStatePrecondition indexStatePrecondition;
-    private final boolean useSynchronizedSession;
     private final long leaseLengthMills;
     private final boolean trackProgress;
 
@@ -227,18 +224,14 @@ public class OnlineIndexer implements AutoCloseable {
         this.index = index;
         this.recordTypes = recordTypes;
         this.configLoader = configLoader;
-        this.config = config;
         this.limit = config.getMaxLimit();
         this.syntheticIndex = syntheticIndex;
-        this.indexStatePrecondition = indexStatePrecondition;
-        this.useSynchronizedSession = useSynchronizedSession;
         this.leaseLengthMills = leaseLengthMillis;
         this.trackProgress = trackProgress;
         this.indexFromIndex = indexFromIndex;
 
         this.recordsRange = computeRecordsRange();
         timeOfLastProgressLogMillis = System.currentTimeMillis();
-        totalRecordsScanned = new AtomicLong(0);
 
         this.common = new OnlineIndexerCommon(runner, recordStoreBuilder,
                 index, recordTypes, configLoader, config,
@@ -271,7 +264,7 @@ public class OnlineIndexer implements AutoCloseable {
     @Nonnull
     @VisibleForTesting
     Config getConfig() {
-        return config;
+        return common.config;
     }
 
     /**
@@ -280,7 +273,7 @@ public class OnlineIndexer implements AutoCloseable {
      */
     @VisibleForTesting
     int getConfigLoaderInvocationCount() {
-        return configLoaderInvocationCount;
+        return indexScanner == null ? configLoaderInvocationCount : indexScanner.getConfigLoaderInvocationCount();
     }
 
 
@@ -291,7 +284,7 @@ public class OnlineIndexer implements AutoCloseable {
      * @return the current number of records to process in one transaction
      */
     public int getLimit() {
-        return limit;
+        return indexScanner == null ? limit : indexScanner.getLimit();
     }
 
     @Nonnull
@@ -359,16 +352,16 @@ public class OnlineIndexer implements AutoCloseable {
     private void loadConfig() {
         configLoaderInvocationCount++;
         if (configLoader != null) {
-            config = configLoader.apply(config);
-            if (limit > config.maxLimit) {
+            common.config = configLoader.apply(common.config);
+            if (limit > common.config.getMaxLimit()) {
                 if (LOGGER.isInfoEnabled()) {
                     LOGGER.info(
                             KeyValueLogMessage.build("Decreasing the limit to the new maxLimit.",
                                     LogMessageKeys.INDEX_NAME, index.getName(),
                                     LogMessageKeys.LIMIT, limit,
-                                    LogMessageKeys.MAX_LIMIT, config.maxLimit).toString());
+                                    LogMessageKeys.MAX_LIMIT, common.config.maxLimit).toString());
                 }
-                limit = config.maxLimit;
+                limit = common.config.maxLimit;
             }
         }
     }
@@ -429,7 +422,7 @@ public class OnlineIndexer implements AutoCloseable {
                 } else {
                     int currTries = tries.getAndIncrement();
                     FDBException fdbE = getFDBException(e);
-                    if (currTries < config.maxRetries && fdbE != null && lessenWorkCodes.contains(fdbE.getCode())) {
+                    if (currTries < common.config.maxRetries && fdbE != null && lessenWorkCodes.contains(fdbE.getCode())) {
                         if (handleLessenWork != null) {
                             handleLessenWork.accept(fdbE, onlineIndexerLogMessageKeyValues);
                         }
@@ -438,7 +431,7 @@ public class OnlineIndexer implements AutoCloseable {
                         if (LOGGER.isWarnEnabled()) {
                             final KeyValueLogMessage message = KeyValueLogMessage.build("Retrying Runner Exception",
                                     LogMessageKeys.INDEXER_CURR_RETRY, currTries,
-                                    LogMessageKeys.INDEXER_MAX_RETRIES, config.maxRetries,
+                                    LogMessageKeys.INDEXER_MAX_RETRIES, common.config.maxRetries,
                                     LogMessageKeys.DELAY, delay,
                                     LogMessageKeys.LIMIT, limit);
                             message.addKeysAndValues(onlineIndexerLogMessageKeyValues);
@@ -480,7 +473,7 @@ public class OnlineIndexer implements AutoCloseable {
                     }
                     // Update records scanned.
                     if (exception == null) {
-                        totalRecordsScanned.addAndGet(recordsScanned.get());
+                        common.getTotalRecordsScanned().addAndGet(recordsScanned.get());
                     } else {
                         recordsScanned.set(0);
                     }
@@ -508,10 +501,10 @@ public class OnlineIndexer implements AutoCloseable {
     }
 
     private void tryToIncreaseLimit(@Nullable Throwable exception) {
-        if (config.increaseLimitAfter > 0) {
+        if (common.config.increaseLimitAfter > 0) {
             if (exception == null) {
                 successCount++;
-                if (successCount >= config.increaseLimitAfter && limit < config.maxLimit) {
+                if (successCount >= common.config.increaseLimitAfter && limit < common.config.maxLimit) {
                     increaseLimit();
                 }
             } else {
@@ -521,7 +514,7 @@ public class OnlineIndexer implements AutoCloseable {
     }
 
     private void increaseLimit() {
-        limit = Math.min(config.maxLimit, Math.max(limit + 1, (4 * limit) / 3));
+        limit = Math.min(common.config.maxLimit, Math.max(limit + 1, (4 * limit) / 3));
         if (LOGGER.isInfoEnabled()) {
             LOGGER.info(KeyValueLogMessage.of("Re-increasing limit of online index build",
                             LogMessageKeys.INDEX_NAME, index.getName(),
@@ -619,7 +612,7 @@ public class OnlineIndexer implements AutoCloseable {
 
             return updateMaintainer.thenCompose(vignore ->
                     context.getApproximateTransactionSize().thenApply(size -> {
-                        if (size >= config.getMaxWriteLimitBytes()) {
+                        if (size >= common.config.getMaxWriteLimitBytes()) {
                             // the transaction becomes too big - stop iterating
                             if (timer != null) {
                                 timer.increment(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RANGES_BY_SIZE);
@@ -798,7 +791,7 @@ public class OnlineIndexer implements AutoCloseable {
                                                         Tuple startTuple, Tuple endTuple, Tuple realEnd,
                                                         Throwable ex) {
         final RuntimeException unwrappedEx = ex == null ? null : getRunner().getDatabase().mapAsyncToSyncException(ex);
-        long toWait = (config.recordsPerSecond == UNLIMITED) ? 0 : 1000 * limit / config.recordsPerSecond;
+        long toWait = (common.config.recordsPerSecond == UNLIMITED) ? 0 : 1000 * limit / common.config.recordsPerSecond;
         if (unwrappedEx == null) {
             if (realEnd != null && !realEnd.equals(endTuple)) {
                 // We didn't make it to the end. Continue on to the next item.
@@ -835,9 +828,9 @@ public class OnlineIndexer implements AutoCloseable {
 
     private void maybeLogBuildProgress(SubspaceProvider subspaceProvider, Tuple startTuple, Tuple endTuple, Tuple realEnd) {
         if (LOGGER.isInfoEnabled()
-                && (config.progressLogIntervalMillis > 0
-                    && System.currentTimeMillis() - timeOfLastProgressLogMillis > config.progressLogIntervalMillis)
-                || config.progressLogIntervalMillis == 0) {
+                && (common.config.progressLogIntervalMillis > 0
+                    && System.currentTimeMillis() - timeOfLastProgressLogMillis > common.config.progressLogIntervalMillis)
+                || common.config.progressLogIntervalMillis == 0) {
             LOGGER.info(KeyValueLogMessage.of("Built Range",
                             LogMessageKeys.INDEX_NAME, index.getName(),
                             LogMessageKeys.INDEX_VERSION, index.getLastModifiedVersion(),
@@ -845,7 +838,7 @@ public class OnlineIndexer implements AutoCloseable {
                             LogMessageKeys.START_TUPLE, startTuple,
                             LogMessageKeys.END_TUPLE, endTuple,
                             LogMessageKeys.REAL_END, realEnd,
-                            LogMessageKeys.RECORDS_SCANNED, totalRecordsScanned.get()),
+                            LogMessageKeys.RECORDS_SCANNED, common.getTotalRecordsScanned().get()),
                             LogMessageKeys.INDEXER_ID, common.getUuid());
             timeOfLastProgressLogMillis = System.currentTimeMillis();
         }
@@ -1188,8 +1181,8 @@ public class OnlineIndexer implements AutoCloseable {
 
     @Nonnull
     CompletableFuture<Void> buildIndexAsyncByIndex(boolean markReadable) {
-        OnlineIndexerBase indexer = new OnlineIndexerByIndex(common, indexFromIndex);
-        return AsyncUtil.composeHandle( indexer.buildIndexAsync(markReadable, leaseLengthMills),
+        indexScanner = new OnlineIndexerByIndex(common, indexFromIndex);
+        return AsyncUtil.composeHandle( indexScanner.buildIndexAsync(markReadable, leaseLengthMills),
                 (ignore, ex) -> {
                     if (ex == null) {
                         return AsyncUtil.DONE;
@@ -1205,8 +1198,8 @@ public class OnlineIndexer implements AutoCloseable {
 
     @Nonnull
     CompletableFuture<Void> buildIndexAsyncByRecords(boolean markReadable) {
-        OnlineIndexerBase indexer = new OnlineIndexerByRecords(common);
-        return indexer.buildIndexAsync(markReadable, leaseLengthMills);
+        indexScanner = new OnlineIndexerByRecords(common);
+        return indexScanner.buildIndexAsync(markReadable, leaseLengthMills);
     }
 
     @Nonnull
@@ -1385,7 +1378,7 @@ public class OnlineIndexer implements AutoCloseable {
     @VisibleForTesting
     // Public could use IndexBuildState.getTotalRecordsScanned instead.
     long getTotalRecordsScanned() {
-        return totalRecordsScanned.get();
+        return common.getTotalRecordsScanned().get();
     }
 
     private FDBDatabaseRunner getRunner() {

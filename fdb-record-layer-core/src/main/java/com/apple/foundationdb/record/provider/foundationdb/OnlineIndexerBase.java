@@ -50,8 +50,6 @@ public abstract class OnlineIndexerBase {
     private static final Logger LOGGER = LoggerFactory.getLogger(OnlineIndexerBase.class);
     @Nonnull
     protected final OnlineIndexerCommon common; // to be used by extenders
-    @Nonnull
-    protected final AtomicLong totalRecordsScanned;
 
     private long timeOfLastProgressLogMillis = 0;
 
@@ -60,16 +58,10 @@ public abstract class OnlineIndexerBase {
 
     OnlineIndexerBase(OnlineIndexerCommon common) {
         this.common = common;
-        this.totalRecordsScanned = new AtomicLong(0);
     }
 
     protected FDBDatabaseRunner getRunner() {
-        SynchronizedSessionRunner synchronizedSessionRunner = common.getSynchronizedSessionRunner();
-        if (synchronizedSessionRunner != null) {
-            return synchronizedSessionRunner;
-        } else {
-            return common.getRunner();
-        }
+        return common.getRunner();
     }
 
     CompletableFuture<Void> buildIndexAsync(boolean markReadable, long leaseLengthMills) {
@@ -211,6 +203,10 @@ public abstract class OnlineIndexerBase {
         return throttle == null ? common.config.getMaxLimit() : throttle.getLimit();
     }
 
+    public int getConfigLoaderInvocationCount() {
+        return throttle == null ? 0 : throttle.getConfigLoaderInvocationCount();
+    }
+
     protected CompletableFuture<Boolean> throttleDelay() {
         int limit = getLimit();
         int recordsPerSecond = common.config.getRecordsPerSecond();
@@ -223,7 +219,7 @@ public abstract class OnlineIndexerBase {
                                         boolean limitControl,
                                         @Nullable List<Object> additionalLogMessageKeyValues) {
 
-        throttle = new OnlineIndexerThrottle(totalRecordsScanned, common, getRunner());
+        throttle = new OnlineIndexerThrottle(common);
         return throttle.buildAsync(buildFunction, limitControl, additionalLogMessageKeyValues);
     }
 }

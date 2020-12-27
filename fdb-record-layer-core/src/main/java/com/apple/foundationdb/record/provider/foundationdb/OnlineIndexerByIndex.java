@@ -131,7 +131,7 @@ public class OnlineIndexerByIndex extends OnlineIndexerBase {
                     LogMessageKeys.INDEX_VERSION, index.getLastModifiedVersion(),
                     subspaceProvider.logKey(), subspaceProvider,
                     LogMessageKeys.NEXT_CONTINUATION, retCont,
-                    LogMessageKeys.RECORDS_SCANNED, totalRecordsScanned.get()),
+                    LogMessageKeys.RECORDS_SCANNED, common.getTotalRecordsScanned().get()),
                     LogMessageKeys.INDEXER_ID, common.getUuid());
         }
     }
