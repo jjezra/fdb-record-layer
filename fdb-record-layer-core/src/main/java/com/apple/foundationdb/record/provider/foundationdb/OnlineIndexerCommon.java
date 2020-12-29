@@ -23,12 +23,15 @@ package com.apple.foundationdb.record.provider.foundationdb;
 import com.apple.foundationdb.record.metadata.Index;
 import com.apple.foundationdb.record.metadata.RecordType;
 import com.apple.foundationdb.record.provider.foundationdb.synchronizedsession.SynchronizedSessionRunner;
+import com.apple.foundationdb.record.query.plan.synthetic.SyntheticRecordFromStoredRecordPlan;
+import com.apple.foundationdb.record.query.plan.synthetic.SyntheticRecordPlanner;
 import com.apple.foundationdb.subspace.Subspace;
 import com.apple.foundationdb.tuple.Tuple;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
@@ -56,7 +59,7 @@ public class OnlineIndexerCommon {
     // the Config definition here without breaking backward compatibility? Shall we create the class here
     // and let OnlineIndexer.Config inherit it?
     @Nonnull public OnlineIndexer.Config config; // may be modified on the fly
-    @Nonnull public Function<OnlineIndexer.Config, OnlineIndexer.Config> configLoader;
+    @Nonnull private final Function<OnlineIndexer.Config, OnlineIndexer.Config> configLoader;
     private int configLoaderInvocationCount = 0;
 
     @Nonnull public Collection<RecordType> recordTypes;
@@ -136,6 +139,15 @@ public class OnlineIndexerCommon {
     @Nonnull
     public IndexStatePrecondition getIndexStatePrecondition() {
         return indexStatePrecondition;
+    }
+
+    @Nullable
+    public SyntheticRecordFromStoredRecordPlan getSyntheticPlan(FDBRecordStore store) {
+        if (!syntheticIndex) {
+            return null;
+        }
+        final SyntheticRecordPlanner syntheticPlanner = new SyntheticRecordPlanner(store.getRecordMetaData(), store.getRecordStoreState().withWriteOnlyIndexes(Collections.singletonList(index.getName())));
+        return syntheticPlanner.forIndex(index);
     }
 
     @Nonnull

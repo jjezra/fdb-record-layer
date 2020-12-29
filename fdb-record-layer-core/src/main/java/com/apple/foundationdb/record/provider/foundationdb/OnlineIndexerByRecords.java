@@ -40,8 +40,6 @@ import com.apple.foundationdb.record.metadata.Index;
 import com.apple.foundationdb.record.metadata.Key;
 import com.apple.foundationdb.record.metadata.MetaDataException;
 import com.apple.foundationdb.record.metadata.RecordType;
-import com.apple.foundationdb.record.query.plan.synthetic.SyntheticRecordFromStoredRecordPlan;
-import com.apple.foundationdb.record.query.plan.synthetic.SyntheticRecordPlanner;
 import com.apple.foundationdb.subspace.Subspace;
 import com.apple.foundationdb.tuple.ByteArrayUtil2;
 import com.apple.foundationdb.tuple.Tuple;
@@ -54,7 +52,6 @@ import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import java.util.ArrayDeque;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
@@ -514,18 +511,15 @@ public class OnlineIndexerByRecords extends OnlineIndexerScanner {
                 additionalLogMessageKeyValues);
     }
 
-    // Builds the index for all of the keys within a given range. This does not update the range set
-    // associated with this index, so it is really designed to be a helper for other methods.
-    // TODO: merge in base
     @Nonnull
-    private CompletableFuture<Tuple> buildRangeOnly(@Nonnull FDBRecordStore store,
-                                                    @Nullable Tuple start, @Nullable Tuple end,
-                                                    boolean respectLimit, @Nullable AtomicLong recordsScanned) {
-        return buildRangeOnly(store, TupleRange.between(start, end), respectLimit, recordsScanned)
-                .thenApply(realEnd -> realEnd == null ? end : realEnd);
+    @SuppressWarnings("unchecked")
+    private RecordCursorResult<FDBStoredRecord<Message>> castCursorResult(RecordCursorResult<?> result) {
+        if (result == null) {
+            throw new MetaDataException("Unexpected null result");
+        }
+        return (RecordCursorResult<FDBStoredRecord<Message>>)result;
     }
 
-    // TupleRange version of above.
     @Nonnull
     private CompletableFuture<Tuple> buildRangeOnly(@Nonnull FDBRecordStore store, @Nonnull TupleRange range,
                                                     boolean respectLimit, @Nullable AtomicLong recordsScanned) {
@@ -548,18 +542,6 @@ public class OnlineIndexerByRecords extends OnlineIndexerScanner {
         final ScanProperties scanProperties = new ScanProperties(executeProperties.build());
         final RecordCursor<FDBStoredRecord<Message>> cursor = store.scanRecords(range, null, scanProperties);
         final AtomicBoolean empty = new AtomicBoolean(true);
-        final FDBStoreTimer timer = getRunner().getTimer();
-
-        final SyntheticRecordFromStoredRecordPlan syntheticPlan;
-        if (common.isSyntheticIndex()) {
-            // Need to do this each transaction because other index enabled state might have changed. Could cache based on that.
-            // Copying the state also guards against changes made by other online building from check version.
-            // TODO: need some state to avoid generating the same synthetic record via more than one self-join path for non-idempotent indexes.
-            final SyntheticRecordPlanner syntheticPlanner = new SyntheticRecordPlanner(store.getRecordMetaData(), store.getRecordStoreState().withWriteOnlyIndexes(Collections.singletonList(index.getName())));
-            syntheticPlan = syntheticPlanner.forIndex(index);
-        } else {
-            syntheticPlan = null;
-        }
 
         AtomicLong recordsScannedCounter = new AtomicLong();
         // Note: This runs all of the updates in serial in order to not invoke a race condition
@@ -567,57 +549,11 @@ public class OnlineIndexerByRecords extends OnlineIndexerScanner {
         // a larger pipeline size would be possible.
 
         final AtomicReference<RecordCursorResult<FDBStoredRecord<Message>>> lastResult = new AtomicReference<>(RecordCursorResult.exhausted());
-        final FDBRecordContext context = store.getContext();
-        return AsyncUtil.whileTrue(() -> cursor.onNext().thenCompose(result -> {
-            if (!result.hasNext()) {
-                // end of the cursor list
-                if (timer != null) {
-                    timer.increment(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RANGES_BY_COUNT);
-                }
-                lastResult.set(result);
-                return AsyncUtil.READY_FALSE;
-            }
 
-            final FDBStoredRecord<Message> rec = result.get();
-            empty.set(false);
-            if (timer != null) {
-                timer.increment(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RECORDS_SCANNED);
-            }
-            recordsScannedCounter.incrementAndGet();
-            if (!common.recordTypes.contains(rec.getRecordType())) {
-                // This record is not our type, swipe left
-                return AsyncUtil.READY_TRUE;
-            }
-            // add this index to the transaction
-            if (isIdempotent) {
-                store.addRecordReadConflict(rec.getPrimaryKey());
-            }
-            if (timer != null) {
-                timer.increment(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RECORDS_INDEXED);
-            }
-
-            final CompletableFuture<Void> updateMaintainer;
-            if (syntheticPlan == null) {
-                updateMaintainer = maintainer.update(null, rec);
-            } else {
-                // Pipeline size is 1, since not all maintainers are thread-safe.
-                updateMaintainer = syntheticPlan.execute(store, rec).forEachAsync(syntheticRecord -> maintainer.update(null, syntheticRecord), 1);
-            }
-
-            return updateMaintainer.thenCompose(vignore ->
-                    context.getApproximateTransactionSize().thenApply(size -> {
-                        if (size >= common.config.getMaxWriteLimitBytes()) {
-                            // the transaction becomes too big - stop iterating
-                            if (timer != null) {
-                                timer.increment(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RANGES_BY_SIZE);
-                            }
-                            lastResult.set(result);
-                            return false;
-                        }
-                        return true;
-                    }));
-
-        }), cursor.getExecutor()
+        return iterateRangeOnly(store, cursor,
+                result -> castCursorResult(result).get(),
+                result -> lastResult.set(castCursorResult(result)),
+                empty, recordsScannedCounter
         ).thenCompose(vignore -> {
             long recordsScannedInTransaction = recordsScannedCounter.get();
             if (recordsScanned != null) {
@@ -646,4 +582,16 @@ public class OnlineIndexerByRecords extends OnlineIndexerScanner {
             }
         });
     }
+
+    // Builds the index for all of the keys within a given range. This does not update the range set
+    // associated with this index, so it is really designed to be a helper for other methods.
+    @Nonnull
+    private CompletableFuture<Tuple> buildRangeOnly(@Nonnull FDBRecordStore store,
+                                                    @Nullable Tuple start, @Nullable Tuple end,
+                                                    boolean respectLimit, @Nullable AtomicLong recordsScanned) {
+        return buildRangeOnly(store, TupleRange.between(start, end), respectLimit, recordsScanned)
+                .thenApply(realEnd -> realEnd == null ? end : realEnd);
+    }
+
+
 }

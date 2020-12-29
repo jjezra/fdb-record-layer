@@ -148,7 +148,7 @@ public class OnlineIndexerByIndex extends OnlineIndexerScanner {
 
             // zz 4 - buildAsync
             // apparently, buildAsync=buildAndCommitWithRetry
-            return buildAsync( (store, recordsScanned) -> buildIndexFromIndexRange(store, cont, recordsScanned),
+            return buildAsync( (store, recordsScanned) -> buildRangeOnly(store, cont, recordsScanned),
                     true,
                     additionalLogMessageKeyValues)
                     .handle((retCont, ex) -> {
@@ -174,7 +174,16 @@ public class OnlineIndexerByIndex extends OnlineIndexerScanner {
     }
 
     @Nonnull
-    private CompletableFuture<byte[]> buildIndexFromIndexRange(@Nonnull FDBRecordStore store, byte[] cont, @Nonnull AtomicLong recordsScanned) {
+    @SuppressWarnings("unchecked")
+    private RecordCursorResult<FDBIndexedRecord<Message>> castCursorResult(RecordCursorResult<?> result) {
+        if (result == null) {
+            throw new MetaDataException("Unexpected null result");
+        }
+        return (RecordCursorResult<FDBIndexedRecord<Message>>)result;
+    }
+
+    @Nonnull
+    private CompletableFuture<byte[]> buildRangeOnly(@Nonnull FDBRecordStore store, byte[] cont, @Nonnull AtomicLong recordsScanned) {
         // zz 5  - buildRangeOnly
         Index index = common.getIndex();
         final Subspace scannedRecordsSubspace = common.indexBuildScannedRecordsSubspace(store);
@@ -209,51 +218,10 @@ public class OnlineIndexerByIndex extends OnlineIndexerScanner {
         final AtomicBoolean isEmpty = new AtomicBoolean(true);
         final FDBStoreTimer timer = getRunner().getTimer();
 
-        return AsyncUtil.whileTrue(() -> cursor.onNext().thenCompose(result -> {
-            // zz 6 - handle a record
-            if (!result.hasNext()) {
-                // end of the cursor list
-                if (timer != null) {
-                    timer.increment(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RANGES_BY_COUNT);
-                }
-                lastResult.set(result);
-                return AsyncUtil.READY_FALSE;
-            }
-
-            final FDBIndexedRecord<Message> msg = result.get();
-            assert msg != null;
-            final FDBStoredRecord<Message> rec = msg.getStoredRecord();
-            isEmpty.set(false);
-            if (timer != null) {
-                timer.increment(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RECORDS_SCANNED);
-            }
-            recordsScannedCounter.incrementAndGet();
-            if (!common.recordTypes.contains(rec.getRecordType())) {
-                // This should never happen! (yet)
-                return AsyncUtil.READY_TRUE;
-            }
-            // add this index to the transaction
-            store.addRecordReadConflict(rec.getPrimaryKey());
-            if (timer != null) {
-                timer.increment(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RECORDS_INDEXED);
-            }
-
-            // Note that synthetic plan is not allowed here
-            final CompletableFuture<Void> updateMaintainer = maintainer.update(null, rec);
-
-            return updateMaintainer.thenCompose(vignore ->
-                    context.getApproximateTransactionSize().thenApply(size -> {
-                        if (size >= common.config.getMaxWriteLimitBytes()) {
-                            // the transaction becomes too big - stop iterating
-                            if (timer != null) {
-                                timer.increment(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RANGES_BY_SIZE);
-                            }
-                            lastResult.set(result);
-                            return false;
-                        }
-                        return true;
-                    }));
-        }), cursor.getExecutor()
+        return iterateRangeOnly(store, cursor,
+                result -> castCursorResult(result).get().getStoredRecord(),
+                result -> lastResult.set(castCursorResult(result)),
+                isEmpty, recordsScannedCounter
         ).thenCompose(vignore -> {
             long recordsScannedInTransaction = recordsScannedCounter.get();
             recordsScanned.addAndGet(recordsScannedInTransaction);

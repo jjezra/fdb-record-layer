@@ -24,11 +24,15 @@ import com.apple.foundationdb.async.AsyncUtil;
 import com.apple.foundationdb.async.MoreAsyncUtil;
 import com.apple.foundationdb.record.IndexState;
 import com.apple.foundationdb.record.RecordCoreException;
+import com.apple.foundationdb.record.RecordCursor;
+import com.apple.foundationdb.record.RecordCursorResult;
 import com.apple.foundationdb.record.logging.KeyValueLogMessage;
 import com.apple.foundationdb.record.logging.LogMessageKeys;
 import com.apple.foundationdb.record.metadata.Index;
 import com.apple.foundationdb.record.provider.foundationdb.synchronizedsession.SynchronizedSessionRunner;
+import com.apple.foundationdb.record.query.plan.synthetic.SyntheticRecordFromStoredRecordPlan;
 import com.google.common.annotations.VisibleForTesting;
+import com.google.protobuf.Message;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -37,8 +41,11 @@ import javax.annotation.Nullable;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiFunction;
+import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -53,7 +60,8 @@ public abstract class OnlineIndexerScanner {
 
     private long timeOfLastProgressLogMillis = 0;
 
-    @Nullable OnlineIndexerThrottle throttle = null;
+    @Nonnull
+    private final OnlineIndexerThrottle throttle ;
 
 
     OnlineIndexerScanner(OnlineIndexerCommon common) {
@@ -201,7 +209,7 @@ public abstract class OnlineIndexerScanner {
     }
 
     protected int getLimit() {
-        return throttle == null ? common.config.getMaxLimit() : throttle.getLimit();
+        return throttle.getLimit();
     }
 
     protected CompletableFuture<Boolean> throttleDelay() {
@@ -217,6 +225,80 @@ public abstract class OnlineIndexerScanner {
                                         @Nullable List<Object> additionalLogMessageKeyValues) {
 
         return throttle.buildAsync(buildFunction, limitControl, additionalLogMessageKeyValues);
+    }
+
+    private static void timerIncrement(@Nullable FDBStoreTimer timer, FDBStoreTimer.Counts event) {
+        // helper function to reduce complexity
+        if (timer != null) {
+            timer.increment(event);
+        }
+    }
+
+    private static CompletableFuture<Void> updateMaintainerBuilder( SyntheticRecordFromStoredRecordPlan syntheticPlan,
+                                                             FDBStoredRecord<Message> rec,
+                                                             IndexMaintainer maintainer,
+                                                             FDBRecordStore store) {
+        // helper function to reduce complexity
+        if (syntheticPlan == null) {
+            return maintainer.update(null, rec);
+        }
+        // Pipeline size is 1, since not all maintainers are thread-safe.
+        return syntheticPlan.execute(store, rec).forEachAsync(syntheticRecord -> maintainer.update(null, syntheticRecord), 1);
+    }
+
+    protected CompletableFuture<Void> iterateRangeOnly(@Nonnull FDBRecordStore store,
+                                                       @Nonnull RecordCursor<?> cursor,
+                                                       @Nonnull Function<RecordCursorResult<?>, FDBStoredRecord<Message>> getRecord,
+                                                       @Nonnull Consumer<RecordCursorResult<?>> lastResultSet,
+                                                       AtomicBoolean isEmpty,
+                                                       AtomicLong recordsScannedCounter
+                                                       ) {
+        final FDBStoreTimer timer = getRunner().getTimer();
+        final Index index = common.getIndex();
+        final IndexMaintainer maintainer = store.getIndexMaintainer(index);
+        final boolean isIdempotent = maintainer.isIdempotent();
+        final FDBRecordContext context = store.getContext();
+        final SyntheticRecordFromStoredRecordPlan syntheticPlan = common.getSyntheticPlan(store);
+        // Need to do this each transaction because other index enabled state might have changed. Could cache based on that.
+        // Copying the state also guards against changes made by other online building from check version.
+        // TODO: need some state to avoid generating the same synthetic record via more than one self-join path for non-idempotent indexes.
+
+        return AsyncUtil.whileTrue(() -> cursor.onNext().thenCompose(result -> {
+            if (!result.hasNext()) {
+                // end of the cursor list
+                timerIncrement(timer, FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RANGES_BY_COUNT);
+                lastResultSet.accept(result);
+                return AsyncUtil.READY_FALSE;
+            }
+
+            final FDBStoredRecord<Message> rec = getRecord.apply(result);
+            isEmpty.set(false);
+            timerIncrement(timer, FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RECORDS_SCANNED);
+            recordsScannedCounter.incrementAndGet();
+            if (!common.recordTypes.contains(rec.getRecordType())) {
+                // This record is not our type, swipe left
+                return AsyncUtil.READY_TRUE;
+            }
+            // add this index to the transaction
+            if (isIdempotent) {
+                store.addRecordReadConflict(rec.getPrimaryKey());
+            }
+            timerIncrement(timer, FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RECORDS_INDEXED);
+
+            final CompletableFuture<Void> updateMaintainer = updateMaintainerBuilder(syntheticPlan, rec, maintainer, store);
+
+            return updateMaintainer.thenCompose(vignore ->
+                    context.getApproximateTransactionSize().thenApply(size -> {
+                        if (size >= common.config.getMaxWriteLimitBytes()) {
+                            // the transaction becomes too big - stop iterating
+                            timerIncrement(timer, FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RANGES_BY_SIZE);
+                            lastResultSet.accept(result);
+                            return false;
+                        }
+                        return true;
+                    }));
+
+        }), cursor.getExecutor());
     }
 }
 

@@ -85,7 +85,7 @@ public class OnlineIndexerThrottle {
         this.limit = common.config.getMaxLimit();
     }
 
-    @VisibleForTesting
+    public
     <R> CompletableFuture<R> buildAsync(@Nonnull BiFunction<FDBRecordStore, AtomicLong, CompletableFuture<R>> buildFunction,
                                         boolean limitControl,
                                         @Nullable List<Object> additionalLogMessageKeyValues) {
