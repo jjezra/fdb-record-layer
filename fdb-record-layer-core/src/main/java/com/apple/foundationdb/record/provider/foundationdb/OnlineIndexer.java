@@ -177,7 +177,7 @@ public class OnlineIndexer implements AutoCloseable {
     private static final Object INDEX_BUILD_SCANNED_RECORDS = 1L;
 
     @Nonnull private final OnlineIndexerCommon common;
-    @Nullable private OnlineIndexerBase indexScanner = null;
+    @Nullable private OnlineIndexerScanner indexScanner = null;
 
     @Nonnull private final FDBDatabaseRunner runner;
     @Nonnull private final FDBRecordStore.Builder recordStoreBuilder;
@@ -273,7 +273,7 @@ public class OnlineIndexer implements AutoCloseable {
      */
     @VisibleForTesting
     int getConfigLoaderInvocationCount() {
-        return indexScanner == null ? configLoaderInvocationCount : indexScanner.getConfigLoaderInvocationCount();
+        return common.getConfigLoaderInvocationCount();
     }
 
 
@@ -1190,6 +1190,12 @@ public class OnlineIndexer implements AutoCloseable {
                     if (indexFromIndex.isAllowRecordScan() &&
                             (ex.getCause() instanceof OnlineIndexerException)) {
                         // fallback to a records scan
+                        if (LOGGER.isWarnEnabled()) {
+                            final KeyValueLogMessage message =
+                                    KeyValueLogMessage.build("fallback to records scan",
+                                    LogMessageKeys.INDEX_NAME, index.getName());
+                            LOGGER.warn(message.toString(), ex);
+                        }
                         return buildIndexAsyncByRecords(markReadable);
                     }
                     throw FDBExceptions.wrapException(ex);

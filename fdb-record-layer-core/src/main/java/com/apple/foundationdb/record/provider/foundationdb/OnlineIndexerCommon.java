@@ -57,6 +57,7 @@ public class OnlineIndexerCommon {
     // and let OnlineIndexer.Config inherit it?
     @Nonnull public OnlineIndexer.Config config; // may be modified on the fly
     @Nonnull public Function<OnlineIndexer.Config, OnlineIndexer.Config> configLoader;
+    private int configLoaderInvocationCount = 0;
 
     @Nonnull public Collection<RecordType> recordTypes;
 
@@ -153,13 +154,21 @@ public class OnlineIndexerCommon {
         return totalRecordsScanned;
     }
 
-    public boolean loadConfig() {
+    public int getConfigLoaderInvocationCount() {
+        return configLoaderInvocationCount;
+    }
 
+    public boolean loadConfig() {
         if (configLoader == null) {
             return false;
         }
+        configLoaderInvocationCount++;
         config = configLoader.apply(config);
         return true;
+    }
+
+    public int getMaxLimit() {
+        return config.getMaxLimit();
     }
 
     @SuppressWarnings("squid:S1452")

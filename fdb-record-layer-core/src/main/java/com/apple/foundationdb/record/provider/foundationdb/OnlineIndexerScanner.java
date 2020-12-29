@@ -44,10 +44,10 @@ import java.util.function.Supplier;
 /**
  * A base class for different types of online indexing scanners.
  */
-public abstract class OnlineIndexerBase {
+public abstract class OnlineIndexerScanner {
 
     @Nonnull
-    private static final Logger LOGGER = LoggerFactory.getLogger(OnlineIndexerBase.class);
+    private static final Logger LOGGER = LoggerFactory.getLogger(OnlineIndexerScanner.class);
     @Nonnull
     protected final OnlineIndexerCommon common; // to be used by extenders
 
@@ -56,8 +56,9 @@ public abstract class OnlineIndexerBase {
     @Nullable OnlineIndexerThrottle throttle = null;
 
 
-    OnlineIndexerBase(OnlineIndexerCommon common) {
+    OnlineIndexerScanner(OnlineIndexerCommon common) {
         this.common = common;
+        this.throttle = new OnlineIndexerThrottle(common);
     }
 
     protected FDBDatabaseRunner getRunner() {
@@ -203,10 +204,6 @@ public abstract class OnlineIndexerBase {
         return throttle == null ? common.config.getMaxLimit() : throttle.getLimit();
     }
 
-    public int getConfigLoaderInvocationCount() {
-        return throttle == null ? 0 : throttle.getConfigLoaderInvocationCount();
-    }
-
     protected CompletableFuture<Boolean> throttleDelay() {
         int limit = getLimit();
         int recordsPerSecond = common.config.getRecordsPerSecond();
@@ -219,7 +216,6 @@ public abstract class OnlineIndexerBase {
                                         boolean limitControl,
                                         @Nullable List<Object> additionalLogMessageKeyValues) {
 
-        throttle = new OnlineIndexerThrottle(common);
         return throttle.buildAsync(buildFunction, limitControl, additionalLogMessageKeyValues);
     }
 }

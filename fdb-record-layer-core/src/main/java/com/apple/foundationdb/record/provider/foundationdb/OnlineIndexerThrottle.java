@@ -16,7 +16,6 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- *
  */
 
 package com.apple.foundationdb.record.provider.foundationdb;
@@ -63,7 +62,6 @@ public class OnlineIndexerThrottle {
     @Nonnull private final AtomicLong totalRecordsScanned;
 
     private int limit;
-    private int configLoaderInvocationCount = 0;
 
     // These error codes represent a list of errors that can occur if there is too much work to be done
     // in a single transaction.
@@ -112,17 +110,7 @@ public class OnlineIndexerThrottle {
         );
     }
 
-    /**
-     * Get the number of times the configuration was loaded.
-     * @return the number of times the {@code configLoader} was invoked
-     */
-    @VisibleForTesting
-    int getConfigLoaderInvocationCount() {
-        return configLoaderInvocationCount;
-    }
-
-    private void loadConfig() {
-        configLoaderInvocationCount++;
+    private synchronized void loadConfig() {
         if (common.loadConfig()) {
             final int maxLimit = common.config.getMaxLimit();
             if (limit > maxLimit) {

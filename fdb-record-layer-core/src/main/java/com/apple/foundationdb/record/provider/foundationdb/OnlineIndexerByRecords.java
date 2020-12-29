@@ -67,7 +67,7 @@ import java.util.function.Function;
  *  This indexer scans all records in the datastore.
  */
 @API(API.Status.UNSTABLE)
-public class OnlineIndexerByRecords extends OnlineIndexerBase {
+public class OnlineIndexerByRecords extends OnlineIndexerScanner {
     @Nonnull private static final Logger LOGGER = LoggerFactory.getLogger(OnlineIndexerByRecords.class);
 
     @Nonnull private final TupleRange recordsRange;

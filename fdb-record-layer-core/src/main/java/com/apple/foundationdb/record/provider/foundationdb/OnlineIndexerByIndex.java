@@ -62,7 +62,7 @@ import java.util.function.Function;
  * This indexer scans records by a source index.
  */
 @API(API.Status.UNSTABLE)
-public class OnlineIndexerByIndex extends OnlineIndexerBase {
+public class OnlineIndexerByIndex extends OnlineIndexerScanner {
     @Nonnull private static final Logger LOGGER = LoggerFactory.getLogger(OnlineIndexerByIndex.class);
     @Nonnull private final OnlineIndexer.IndexFromIndexPolicy policy;
 
