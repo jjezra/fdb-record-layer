@@ -48,6 +48,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
@@ -75,7 +76,7 @@ public class OnlineIndexerByIndex extends OnlineIndexerScanner {
     @Nonnull
     @Override
     CompletableFuture<Void> scanBuildIndexAsync() {
-        // zz 1 - runner
+
         return getRunner().runAsync(context -> common.openRecordStore(context)
                 .thenCompose( store -> {
                     // first verify that both src and tgt are of a single, similar, type
@@ -97,7 +98,6 @@ public class OnlineIndexerByIndex extends OnlineIndexerScanner {
                     return context.getReadVersionAsync()
                             .thenCompose(vignore -> {
                                 SubspaceProvider subspaceProvider = common.getRecordStoreBuilder().getSubspaceProvider();
-                                // zz 2 - subspace
                                 return subspaceProvider.getSubspaceAsync(context)
                                         .thenCompose(subspace ->
                                                 buildIndexFromIndex(subspaceProvider, subspace)
@@ -113,7 +113,6 @@ public class OnlineIndexerByIndex extends OnlineIndexerScanner {
 
     @Nonnull
     private CompletableFuture<Void> markBuilt(Subspace subspace) {
-        // zz 2.1 - mark built
         // Grand Finale - after fully building the index, remove all missing ranges in one gulp
         return getRunner().runAsync(context -> {
             final Index index = common.getIndex();
@@ -140,19 +139,16 @@ public class OnlineIndexerByIndex extends OnlineIndexerScanner {
     private CompletableFuture<Void> buildIndexFromIndex(SubspaceProvider subspaceProvider, @Nonnull Subspace subspace) {
         AtomicReference<byte[]> nextCont = new AtomicReference<>();
 
-        // zz 3 while true -> runner/store -> build chunk
         return AsyncUtil.whileTrue(() -> {
             byte [] cont = nextCont.get();
             final List<Object> additionalLogMessageKeyValues = Arrays.asList(LogMessageKeys.CALLING_METHOD, "buildIndexFromIndex",
                     LogMessageKeys.NEXT_CONTINUATION, cont == null ? "" : cont);
 
-            // zz 4 - buildAsync
             // apparently, buildAsync=buildAndCommitWithRetry
             return buildAsync( (store, recordsScanned) -> buildRangeOnly(store, cont, recordsScanned),
                     true,
                     additionalLogMessageKeyValues)
                     .handle((retCont, ex) -> {
-                        // zz 4.1 - handle range
                         if (ex == null) {
                             maybeLogBuildProgress(subspaceProvider, retCont);
                             if (retCont == null) {
@@ -175,16 +171,24 @@ public class OnlineIndexerByIndex extends OnlineIndexerScanner {
 
     @Nonnull
     @SuppressWarnings("unchecked")
-    private RecordCursorResult<FDBIndexedRecord<Message>> castCursorResult(RecordCursorResult<?> result) {
+    private static RecordCursorResult<FDBIndexedRecord<Message>> castCursorResult(RecordCursorResult<?> result) {
+        // helper function
         if (result == null) {
             throw new MetaDataException("Unexpected null result");
         }
         return (RecordCursorResult<FDBIndexedRecord<Message>>)result;
     }
 
+    @Nullable
+    private static FDBStoredRecord<Message> castCursorResultToStoreRecord(RecordCursorResult<?> result) {
+        RecordCursorResult<FDBIndexedRecord<Message>> cursorResult = castCursorResult(result);
+        FDBIndexedRecord<Message> indexResult = cursorResult.get();
+        return indexResult == null ? null : indexResult.getStoredRecord();
+    }
+
     @Nonnull
     private CompletableFuture<byte[]> buildRangeOnly(@Nonnull FDBRecordStore store, byte[] cont, @Nonnull AtomicLong recordsScanned) {
-        // zz 5  - buildRangeOnly
+
         Index index = common.getIndex();
         final Subspace scannedRecordsSubspace = common.indexBuildScannedRecordsSubspace(store);
         final RecordMetaDataProvider recordMetaDataProvider = common.getRecordStoreBuilder().getMetaDataProvider();
@@ -198,6 +202,10 @@ public class OnlineIndexerByIndex extends OnlineIndexerScanner {
         if (! maintainer.isIdempotent() ) {
             // idempotence - We could have verified it at the first iteration only, but the repeating checks seem harmless
             buildIndexFromIndexThrowEx("IndexFromIndex: tgt is not idempotent");
+        }
+        if (srcIndex == null) {
+            // this should never happen. But it makes the compiler happy
+            buildIndexFromIndexThrowEx("IndexFromIndex: src is not set");
         }
         if (! store.isIndexReadable(srcIndex)) {
             // readability - This method shouldn't block if one has already opened the record store (as we did)
@@ -214,12 +222,10 @@ public class OnlineIndexerByIndex extends OnlineIndexerScanner {
 
         final AtomicLong recordsScannedCounter = new AtomicLong();
         final AtomicReference<RecordCursorResult<FDBIndexedRecord<Message>>> lastResult = new AtomicReference<>(RecordCursorResult.exhausted());
-        final FDBRecordContext context = store.getContext();
         final AtomicBoolean isEmpty = new AtomicBoolean(true);
-        final FDBStoreTimer timer = getRunner().getTimer();
 
         return iterateRangeOnly(store, cursor,
-                result -> castCursorResult(result).get().getStoredRecord(),
+                OnlineIndexerByIndex::castCursorResultToStoreRecord,
                 result -> lastResult.set(castCursorResult(result)),
                 isEmpty, recordsScannedCounter
         ).thenCompose(vignore -> {
@@ -232,5 +238,21 @@ public class OnlineIndexerByIndex extends OnlineIndexerScanner {
             final byte[] retCont = isEmpty.get() ? null : lastResult.get().getContinuation().toBytes();
             return CompletableFuture.completedFuture( retCont );
         });
+    }
+
+    // support rebuildIndexAsync
+    @Nonnull
+    @Override
+    CompletableFuture<Void> scanRebuildIndexAsync(FDBRecordStore store) {
+        AtomicReference<byte[]> nextCont = new AtomicReference<>();
+        AtomicLong recordScanned = new AtomicLong();
+        return AsyncUtil.whileTrue(() ->
+                buildRangeOnly(store, nextCont.get(), recordScanned).thenApply(cont -> {
+                    if (cont == null) {
+                        return false;
+                    }
+                    nextCont.set(cont);
+                    return true;
+                }), store.getExecutor());
     }
 }

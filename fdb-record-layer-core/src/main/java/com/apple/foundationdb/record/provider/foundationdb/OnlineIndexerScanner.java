@@ -20,8 +20,10 @@
 
 package com.apple.foundationdb.record.provider.foundationdb;
 
+import com.apple.foundationdb.Transaction;
 import com.apple.foundationdb.async.AsyncUtil;
 import com.apple.foundationdb.async.MoreAsyncUtil;
+import com.apple.foundationdb.async.RangeSet;
 import com.apple.foundationdb.record.IndexState;
 import com.apple.foundationdb.record.RecordCoreException;
 import com.apple.foundationdb.record.RecordCursor;
@@ -300,5 +302,25 @@ public abstract class OnlineIndexerScanner {
 
         }), cursor.getExecutor());
     }
+
+    // rebuildIndexScan
+    @Nonnull
+    public CompletableFuture<Void> rebuildIndexAsync(@Nonnull FDBRecordStore store) {
+        Index index = common.getIndex();
+        Transaction tr = store.ensureContextActive();
+        store.clearIndexData(index);
+
+        // Clear the associated range set (done as part of clearIndexData above) and make it instead equal to
+        // the complete range. This isn't super necessary, but it is done
+        // to avoid (1) concurrent OnlineIndexBuilders doing more work and
+        // (2) to allow for write-only indexes to continue to do the right thing.
+        RangeSet rangeSet = new RangeSet(store.indexRangeSubspace(index));
+        CompletableFuture<Boolean> rangeFuture = rangeSet.insertRange(tr, null, null);
+        CompletableFuture<Void> buildFuture = scanRebuildIndexAsync(store);
+
+        return CompletableFuture.allOf(rangeFuture, buildFuture);
+    }
+
+    abstract CompletableFuture<Void> scanRebuildIndexAsync(FDBRecordStore store);
 }
 

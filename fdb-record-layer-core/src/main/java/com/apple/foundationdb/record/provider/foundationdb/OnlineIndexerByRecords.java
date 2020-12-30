@@ -30,6 +30,7 @@ import com.apple.foundationdb.async.RangeSet;
 import com.apple.foundationdb.record.EndpointType;
 import com.apple.foundationdb.record.ExecuteProperties;
 import com.apple.foundationdb.record.IsolationLevel;
+import com.apple.foundationdb.record.RecordCoreException;
 import com.apple.foundationdb.record.RecordCursor;
 import com.apple.foundationdb.record.RecordCursorResult;
 import com.apple.foundationdb.record.ScanProperties;
@@ -45,13 +46,16 @@ import com.apple.foundationdb.tuple.ByteArrayUtil2;
 import com.apple.foundationdb.tuple.Tuple;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.Message;
+import org.apache.commons.lang3.tuple.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
@@ -103,7 +107,6 @@ public class OnlineIndexerByRecords extends OnlineIndexerScanner {
         }
     }
 
-
     @Nonnull
     private TupleRange computeRecordsRange() {
         Tuple low = null;
@@ -151,15 +154,10 @@ public class OnlineIndexerByRecords extends OnlineIndexerScanner {
      * @param store the record store in which to rebuild the index
      * @return a future that will contain the range of records in the interior of the record store
      */
-    @Nonnull
-    public CompletableFuture<TupleRange> buildEndpoints(@Nonnull FDBRecordStore store) {
-        return buildEndpoints(store, null);
-    }
 
-    // just like the overload that doesn't take a recordsScanned
     @Nonnull
-    private CompletableFuture<TupleRange> buildEndpoints(@Nonnull FDBRecordStore store,
-                                                         @Nullable AtomicLong recordsScanned) {
+    public CompletableFuture<TupleRange> buildEndpoints(@Nonnull FDBRecordStore store,
+                                                        @Nullable AtomicLong recordsScanned) {
         final RangeSet rangeSet = new RangeSet(store.indexRangeSubspace(common.getIndex()));
         if (TupleRange.ALL.equals(recordsRange)) {
             return buildEndpoints(store, rangeSet, recordsScanned);
@@ -225,7 +223,7 @@ public class OnlineIndexerByRecords extends OnlineIndexerScanner {
 
     /**
      * Builds (with a retry loop) the endpoints of an index. See the
-     * {@link #buildEndpoints(FDBRecordStore) buildEndpoints()} method that takes
+     * {@link #buildEndpoints(FDBRecordStore, AtomicLong) buildEndpoints()} method that takes
      * an {@link FDBRecordStore} as its parameter for more details. This will retry on that function
      * until it gets a non-exceptional result and return the results back.
      *
@@ -520,6 +518,16 @@ public class OnlineIndexerByRecords extends OnlineIndexerScanner {
         return (RecordCursorResult<FDBStoredRecord<Message>>)result;
     }
 
+    // Builds the index for all of the keys within a given range. This does not update the range set
+    // associated with this index, so it is really designed to be a helper for other methods.
+    @Nonnull
+    private CompletableFuture<Tuple> buildRangeOnly(@Nonnull FDBRecordStore store,
+                                                    @Nullable Tuple start, @Nullable Tuple end,
+                                                    boolean respectLimit, @Nullable AtomicLong recordsScanned) {
+        return buildRangeOnly(store, TupleRange.between(start, end), respectLimit, recordsScanned)
+                .thenApply(realEnd -> realEnd == null ? end : realEnd);
+    }
+
     @Nonnull
     private CompletableFuture<Tuple> buildRangeOnly(@Nonnull FDBRecordStore store, @Nonnull TupleRange range,
                                                     boolean respectLimit, @Nullable AtomicLong recordsScanned) {
@@ -583,15 +591,86 @@ public class OnlineIndexerByRecords extends OnlineIndexerScanner {
         });
     }
 
-    // Builds the index for all of the keys within a given range. This does not update the range set
-    // associated with this index, so it is really designed to be a helper for other methods.
+    // support rebuildIndexAsync
     @Nonnull
-    private CompletableFuture<Tuple> buildRangeOnly(@Nonnull FDBRecordStore store,
-                                                    @Nullable Tuple start, @Nullable Tuple end,
-                                                    boolean respectLimit, @Nullable AtomicLong recordsScanned) {
-        return buildRangeOnly(store, TupleRange.between(start, end), respectLimit, recordsScanned)
-                .thenApply(realEnd -> realEnd == null ? end : realEnd);
+    @Override
+    CompletableFuture<Void> scanRebuildIndexAsync(FDBRecordStore store) {
+        AtomicReference<TupleRange> rangeToGo = new AtomicReference<>(recordsRange);
+        return AsyncUtil.whileTrue(() ->
+                buildRangeOnly(store, rangeToGo.get(), true, null).thenApply(nextStart -> {
+                    if (nextStart == null) {
+                        return false;
+                    } else {
+                        rangeToGo.set(new TupleRange(nextStart, rangeToGo.get().getHigh(), EndpointType.RANGE_INCLUSIVE, rangeToGo.get().getHighEndpoint()));
+                        return true;
+                    }
+                }), store.getExecutor());
     }
 
+    // support splitIndexBuildRange
+    @Nonnull
+    public List<Pair<Tuple, Tuple>> splitIndexBuildRange(int minSplit, int maxSplit) {
+        TupleRange originalRange = getRunner().asyncToSync(FDBStoreTimer.Waits.WAIT_BUILD_ENDPOINTS, buildEndpoints());
+
+        // There is no range needing to be built.
+        if (originalRange == null) {
+            return Collections.emptyList();
+        }
+
+        if (minSplit < 1 || maxSplit < 1 || minSplit > maxSplit) {
+            throw new RecordCoreException("splitIndexBuildRange should have 1 < minSplit <= maxSplit");
+        }
+
+        List<Tuple> boundaries = getPrimaryKeyBoundaries(originalRange);
+
+        // The range only spans across very few FDB servers so parallelism is not necessary.
+        if (boundaries.size() - 1 < minSplit) {
+            return Collections.singletonList(Pair.of(originalRange.getLow(), originalRange.getHigh()));
+        }
+
+        List<Pair<Tuple, Tuple>> splitRanges = new ArrayList<>(Math.min(boundaries.size() - 1, maxSplit));
+
+        // step size >= 1
+        int stepSize = -Math.floorDiv(-(boundaries.size() - 1), maxSplit);  // Read ceilDiv(boundaries.size() - 1, maxSplit).
+        int start = 0;
+        while (true) {
+            int next = start + stepSize;
+            if (next < boundaries.size() - 1) {
+                splitRanges.add(Pair.of(boundaries.get(start), boundaries.get(next)));
+            } else {
+                splitRanges.add(Pair.of(boundaries.get(start), boundaries.get(boundaries.size() - 1)));
+                break;
+            }
+            start = next;
+        }
+
+        if (LOGGER.isInfoEnabled()) {
+            LOGGER.info(KeyValueLogMessage.of("split index build range",
+                    LogMessageKeys.INDEX_NAME, common.getIndex().getName(),
+                    LogMessageKeys.ORIGINAL_RANGE, originalRange,
+                    LogMessageKeys.SPLIT_RANGES, splitRanges));
+        }
+
+        return splitRanges;
+    }
+
+    private List<Tuple> getPrimaryKeyBoundaries(TupleRange tupleRange) {
+        List<Tuple> boundaries = getRunner().run(context -> {
+            context.getReadVersion(); // for instrumentation reasons
+            RecordCursor<Tuple> cursor = common.getRecordStoreBuilder().copyBuilder().setContext(context).open()
+                    .getPrimaryKeyBoundaries(tupleRange.getLow(), tupleRange.getHigh());
+            return context.asyncToSync(FDBStoreTimer.Waits.WAIT_GET_BOUNDARY, cursor.asList());
+        });
+
+        // Add the two endpoints if they are not in the result
+        if (boundaries.isEmpty() || tupleRange.getLow().compareTo(boundaries.get(0)) < 0) {
+            boundaries.add(0, tupleRange.getLow());
+        }
+        if (tupleRange.getHigh().compareTo(boundaries.get(boundaries.size() - 1)) > 0) {
+            boundaries.add(tupleRange.getHigh());
+        }
+
+        return boundaries;
+    }
 
 }

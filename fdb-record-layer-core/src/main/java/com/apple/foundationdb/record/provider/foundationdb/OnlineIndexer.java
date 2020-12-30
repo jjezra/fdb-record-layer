@@ -87,6 +87,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
  * Builds an index online, i.e., concurrently with other database operations. In order to minimize
@@ -183,7 +184,6 @@ public class OnlineIndexer implements AutoCloseable {
     @Nonnull private final FDBRecordStore.Builder recordStoreBuilder;
     @Nonnull private final Index index;
     @Nonnull private final Collection<RecordType> recordTypes;
-    @Nonnull private final TupleRange recordsRange;
 
     /**
      * The current number of records to process in a single transaction, this may go up or down when using
@@ -230,7 +230,6 @@ public class OnlineIndexer implements AutoCloseable {
         this.trackProgress = trackProgress;
         this.indexFromIndex = indexFromIndex;
 
-        this.recordsRange = computeRecordsRange();
         timeOfLastProgressLogMillis = System.currentTimeMillis();
 
         this.common = new OnlineIndexerCommon(runner, recordStoreBuilder,
@@ -284,7 +283,7 @@ public class OnlineIndexer implements AutoCloseable {
      * @return the current number of records to process in one transaction
      */
     public int getLimit() {
-        return indexScanner == null ? limit : indexScanner.getLimit();
+        return indexScanner == null ? common.getMaxLimit() : indexScanner.getLimit();
     }
 
     @Nonnull
@@ -948,29 +947,11 @@ public class OnlineIndexer implements AutoCloseable {
      */
     @Nonnull
     public CompletableFuture<Void> rebuildIndexAsync(@Nonnull FDBRecordStore store) {
-        Transaction tr = store.ensureContextActive();
-        store.clearIndexData(index);
-
-        // Clear the associated range set (done as part of clearIndexData above) and make it instead equal to
-        // the complete range. This isn't super necessary, but it is done
-        // to avoid (1) concurrent OnlineIndexBuilders doing more work and
-        // (2) to allow for write-only indexes to continue to do the right thing.
-        RangeSet rangeSet = new RangeSet(store.indexRangeSubspace(index));
-        CompletableFuture<Boolean> rangeFuture = rangeSet.insertRange(tr, null, null);
-
-        // Rebuild the index by going through all of the records in a transaction.
-        AtomicReference<TupleRange> rangeToGo = new AtomicReference<>(recordsRange);
-        CompletableFuture<Void> buildFuture = AsyncUtil.whileTrue(() ->
-                buildRangeOnly(store, rangeToGo.get(), true, null).thenApply(nextStart -> {
-                    if (nextStart == null) {
-                        return false;
-                    } else {
-                        rangeToGo.set(new TupleRange(nextStart, rangeToGo.get().getHigh(), EndpointType.RANGE_INCLUSIVE, rangeToGo.get().getHighEndpoint()));
-                        return true;
-                    }
-                }), store.getExecutor());
-
-        return CompletableFuture.allOf(rangeFuture, buildFuture);
+        if (indexFromIndex.isActive()) {
+            return rebuildIndexAsyncByIndex(store);
+        } else {
+            return rebuildIndexAsyncByRecords(store);
+        }
     }
 
     /**
@@ -982,6 +963,20 @@ public class OnlineIndexer implements AutoCloseable {
      */
     public void rebuildIndex(@Nonnull FDBRecordStore store) {
         asyncToSync(FDBStoreTimer.Waits.WAIT_ONLINE_BUILD_INDEX, rebuildIndexAsync(store));
+    }
+
+    @Nonnull
+    private CompletableFuture<Void> rebuildIndexAsyncByRecords(@Nonnull FDBRecordStore store) {
+        indexScanner = new OnlineIndexerByRecords(common);
+        return indexScanner.rebuildIndexAsync(store);
+    }
+
+    @Nonnull
+    private CompletableFuture<Void> rebuildIndexAsyncByIndex(@Nonnull FDBRecordStore store) {
+        indexScanner = new OnlineIndexerByIndex(common, indexFromIndex);
+        return AsyncUtil.composeHandle( indexScanner.rebuildIndexAsync(store),
+                (ignore, ex) ->
+                        handleIndexFromIndexReturnOrFallback(ex, () -> rebuildIndexAsyncByRecords(store)));
     }
 
     /**
@@ -1011,67 +1006,8 @@ public class OnlineIndexer implements AutoCloseable {
     @Nonnull
     private CompletableFuture<TupleRange> buildEndpoints(@Nonnull FDBRecordStore store,
                                                          @Nullable AtomicLong recordsScanned) {
-        final RangeSet rangeSet = new RangeSet(store.indexRangeSubspace(index));
-        if (TupleRange.ALL.equals(recordsRange)) {
-            return buildEndpoints(store, rangeSet, recordsScanned);
-        }
-        // If records do not occupy whole range, first mark outside as built.
-        final Range asRange = recordsRange.toRange();
-        return CompletableFuture.allOf(
-                rangeSet.insertRange(store.ensureContextActive(), null, asRange.begin),
-                rangeSet.insertRange(store.ensureContextActive(), asRange.end, null))
-                .thenCompose(vignore -> buildEndpoints(store, rangeSet, recordsScanned));
-    }
-
-    @Nonnull
-    private CompletableFuture<TupleRange> buildEndpoints(@Nonnull FDBRecordStore store, @Nonnull RangeSet rangeSet,
-                                                         @Nullable AtomicLong recordsScanned) {
-        boolean isIdempotent = store.getIndexMaintainer(index).isIdempotent();
-        final IsolationLevel isolationLevel =
-                isIdempotent ?
-                // If idempotent: since double indexing is harmless, we can use individual records protection instead of
-                // a range conflict one - which means that new records, added to the range while indexing the SNAPSHOT,
-                // will not cause a conflict during the commit. At worse, few records (if added after marking WRITE_ONLY but
-                // before this method's query) will be re-indexed.
-                IsolationLevel.SNAPSHOT :
-                IsolationLevel.SERIALIZABLE;
-        final ExecuteProperties limit1 = ExecuteProperties.newBuilder()
-                .setReturnedRowLimit(1)
-                .setIsolationLevel(isolationLevel)
-                .build();
-        final ScanProperties forward = new ScanProperties(limit1);
-
-        RecordCursor<FDBStoredRecord<Message>> beginCursor = store.scanRecords(recordsRange, null, forward);
-        CompletableFuture<Tuple> begin = beginCursor.onNext().thenCompose(result -> {
-            if (result.hasNext()) {
-                Tuple firstTuple = result.get().getPrimaryKey();
-                return buildRange(store, null, firstTuple, recordsScanned).thenApply(vignore -> firstTuple);
-            } else {
-                // Empty range -- add the whole thing.
-                return rangeSet.insertRange(store.ensureContextActive(), null, null).thenApply(bignore -> null);
-            }
-        });
-
-        final ScanProperties backward = new ScanProperties(limit1, true);
-        RecordCursor<FDBStoredRecord<Message>> endCursor = store.scanRecords(recordsRange, null, backward);
-        CompletableFuture<Tuple> end = endCursor.onNext().thenCompose(result -> {
-            if (result.hasNext()) {
-                Tuple lastTuple = result.get().getPrimaryKey();
-                return buildRange(store, lastTuple, null, recordsScanned).thenApply(vignore -> lastTuple);
-            } else {
-                // As the range is empty, the whole range needs to be added, but that is accomplished
-                // by the above future, so this has nothing to do.
-                return CompletableFuture.completedFuture(null);
-            }
-        });
-
-        return begin.thenCombine(end, (firstTuple, lastTuple) -> {
-            if (firstTuple == null || firstTuple.equals(lastTuple)) {
-                return null;
-            } else {
-                return new TupleRange(firstTuple, lastTuple, EndpointType.RANGE_INCLUSIVE, EndpointType.RANGE_EXCLUSIVE);
-            }
-        });
+        final OnlineIndexerByRecords scanner = new OnlineIndexerByRecords(common);
+        return scanner.buildEndpoints(store, recordsScanned);
     }
 
     /**
@@ -1084,8 +1020,8 @@ public class OnlineIndexer implements AutoCloseable {
      */
     @Nonnull
     public CompletableFuture<TupleRange> buildEndpoints() {
-        final List<Object> additionalLogMessageKeyValues = Arrays.asList(LogMessageKeys.CALLING_METHOD, "buildEndpoints");
-        return buildAsync(this::buildEndpoints, false, additionalLogMessageKeyValues);
+        OnlineIndexerByRecords scanner = new OnlineIndexerByRecords(common);
+        return scanner.buildEndpoints();
     }
 
     /**
@@ -1180,32 +1116,36 @@ public class OnlineIndexer implements AutoCloseable {
     }
 
     @Nonnull
-    CompletableFuture<Void> buildIndexAsyncByIndex(boolean markReadable) {
-        indexScanner = new OnlineIndexerByIndex(common, indexFromIndex);
-        return AsyncUtil.composeHandle( indexScanner.buildIndexAsync(markReadable, leaseLengthMills),
-                (ignore, ex) -> {
-                    if (ex == null) {
-                        return AsyncUtil.DONE;
-                    }
-                    if (indexFromIndex.isAllowRecordScan() &&
-                            (ex.getCause() instanceof OnlineIndexerException)) {
-                        // fallback to a records scan
-                        if (LOGGER.isWarnEnabled()) {
-                            final KeyValueLogMessage message =
-                                    KeyValueLogMessage.build("fallback to records scan",
-                                    LogMessageKeys.INDEX_NAME, index.getName());
-                            LOGGER.warn(message.toString(), ex);
-                        }
-                        return buildIndexAsyncByRecords(markReadable);
-                    }
-                    throw FDBExceptions.wrapException(ex);
-                });
+    private CompletableFuture<Void> buildIndexAsyncByRecords(boolean markReadable) {
+        indexScanner = new OnlineIndexerByRecords(common);
+        return indexScanner.buildIndexAsync(markReadable, leaseLengthMills);
     }
 
     @Nonnull
-    CompletableFuture<Void> buildIndexAsyncByRecords(boolean markReadable) {
-        indexScanner = new OnlineIndexerByRecords(common);
-        return indexScanner.buildIndexAsync(markReadable, leaseLengthMills);
+    private CompletableFuture<Void> buildIndexAsyncByIndex(boolean markReadable) {
+        indexScanner = new OnlineIndexerByIndex(common, indexFromIndex);
+        return AsyncUtil.composeHandle( indexScanner.buildIndexAsync(markReadable, leaseLengthMills),
+                (ignore, ex) ->
+                        handleIndexFromIndexReturnOrFallback(ex, () -> buildIndexAsyncByRecords(markReadable)));
+    }
+
+    @Nonnull
+    private CompletableFuture<Void> handleIndexFromIndexReturnOrFallback(Throwable ex, Supplier<CompletableFuture<Void>> fallback) {
+        if (ex == null) {
+            return AsyncUtil.DONE;
+        }
+        if (indexFromIndex.isAllowRecordScan() &&
+                (ex.getCause() instanceof OnlineIndexerException)) {
+            // fallback to a records scan
+            if (LOGGER.isWarnEnabled()) {
+                final KeyValueLogMessage message =
+                        KeyValueLogMessage.build("fallback to records scan",
+                                LogMessageKeys.INDEX_NAME, index.getName());
+                LOGGER.warn(message.toString(), ex);
+            }
+            return fallback.get();
+        }
+        throw FDBExceptions.wrapException(ex);
     }
 
     @Nonnull
@@ -1249,67 +1189,8 @@ public class OnlineIndexer implements AutoCloseable {
     @API(API.Status.EXPERIMENTAL)
     @Nonnull
     public List<Pair<Tuple, Tuple>> splitIndexBuildRange(int minSplit, int maxSplit) {
-        TupleRange originalRange = getRunner().asyncToSync(FDBStoreTimer.Waits.WAIT_BUILD_ENDPOINTS, buildEndpoints());
-
-        // There is no range needing to be built.
-        if (originalRange == null) {
-            return Collections.emptyList();
-        }
-
-        if (minSplit < 1 || maxSplit < 1 || minSplit > maxSplit) {
-            throw new RecordCoreException("splitIndexBuildRange should have 1 < minSplit <= maxSplit");
-        }
-
-        List<Tuple> boundaries = getPrimaryKeyBoundaries(originalRange);
-
-        // The range only spans across very few FDB servers so parallelism is not necessary.
-        if (boundaries.size() - 1 < minSplit) {
-            return Collections.singletonList(Pair.of(originalRange.getLow(), originalRange.getHigh()));
-        }
-
-        List<Pair<Tuple, Tuple>> splitRanges = new ArrayList<>(Math.min(boundaries.size() - 1, maxSplit));
-
-        // step size >= 1
-        int stepSize = -Math.floorDiv(-(boundaries.size() - 1), maxSplit);  // Read ceilDiv(boundaries.size() - 1, maxSplit).
-        int start = 0;
-        while (true) {
-            int next = start + stepSize;
-            if (next < boundaries.size() - 1) {
-                splitRanges.add(Pair.of(boundaries.get(start), boundaries.get(next)));
-            } else {
-                splitRanges.add(Pair.of(boundaries.get(start), boundaries.get(boundaries.size() - 1)));
-                break;
-            }
-            start = next;
-        }
-
-        if (LOGGER.isInfoEnabled()) {
-            LOGGER.info(KeyValueLogMessage.of("split index build range",
-                            LogMessageKeys.INDEX_NAME, index.getName(),
-                            LogMessageKeys.ORIGINAL_RANGE, originalRange,
-                            LogMessageKeys.SPLIT_RANGES, splitRanges));
-        }
-
-        return splitRanges;
-    }
-
-    private List<Tuple> getPrimaryKeyBoundaries(TupleRange tupleRange) {
-        List<Tuple> boundaries = getRunner().run(context -> {
-            context.getReadVersion(); // for instrumentation reasons
-            RecordCursor<Tuple> cursor = recordStoreBuilder.copyBuilder().setContext(context).open()
-                    .getPrimaryKeyBoundaries(tupleRange.getLow(), tupleRange.getHigh());
-            return context.asyncToSync(FDBStoreTimer.Waits.WAIT_GET_BOUNDARY, cursor.asList());
-        });
-
-        // Add the two endpoints if they are not in the result
-        if (boundaries.isEmpty() || tupleRange.getLow().compareTo(boundaries.get(0)) < 0) {
-            boundaries.add(0, tupleRange.getLow());
-        }
-        if (tupleRange.getHigh().compareTo(boundaries.get(boundaries.size() - 1)) > 0) {
-            boundaries.add(tupleRange.getHigh());
-        }
-
-        return boundaries;
+        OnlineIndexerByRecords scanner = new OnlineIndexerByRecords(common);
+        return scanner.splitIndexBuildRange(minSplit, maxSplit);
     }
 
     /**
