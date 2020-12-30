@@ -141,21 +141,8 @@ public class OnlineIndexer implements AutoCloseable {
     @Nullable private OnlineIndexerScanner indexScanner = null;
 
     @Nonnull private final FDBDatabaseRunner runner;
-    @Nonnull private final FDBRecordStore.Builder recordStoreBuilder;
     @Nonnull private final Index index;
-
-    /**
-     * The current number of records to process in a single transaction, this may go up or down when using
-     * {@link #runAsync(Function, BiFunction, BiConsumer, List)}, but never above {@link Config#limit}.
-     */
-    private int limit;
     @Nonnull private final IndexFromIndexPolicy indexFromIndex;
-    /**
-     * The total number of records scanned in the build.
-     * @see Builder#setProgressLogIntervalMillis(long)
-     */
-
-    private final long leaseLengthMills;
 
     @SuppressWarnings("squid:S00107")
     OnlineIndexer(@Nonnull FDBDatabaseRunner runner,
@@ -169,10 +156,7 @@ public class OnlineIndexer implements AutoCloseable {
                   boolean trackProgress,
                   @Nonnull IndexFromIndexPolicy indexFromIndex) {
         this.runner = runner;
-        this.recordStoreBuilder = recordStoreBuilder;
         this.index = index;
-        this.limit = config.getMaxLimit();
-        this.leaseLengthMills = leaseLengthMillis;
         this.indexFromIndex = indexFromIndex;
 
         this.common = new OnlineIndexerCommon(runner, recordStoreBuilder,
@@ -180,8 +164,58 @@ public class OnlineIndexer implements AutoCloseable {
                 syntheticIndex,
                 indexStatePrecondition.getCommonVal(),
                 trackProgress,
-                useSynchronizedSession
+                useSynchronizedSession,
+                leaseLengthMillis
             );
+    }
+
+    @Nonnull private OnlineIndexerByIndex getScannerByIndex() {
+        if (! (indexScanner instanceof OnlineIndexerByIndex)) { // this covers null pointer
+            indexScanner = new OnlineIndexerByIndex(common, indexFromIndex);
+        }
+        return (OnlineIndexerByIndex)indexScanner;
+    }
+
+    @Nonnull
+    private CompletableFuture<Void> handleScannerReturnOrFallback(Throwable ex, Supplier<CompletableFuture<Void>> fallback) {
+        if (ex == null) {
+            return AsyncUtil.DONE;
+        }
+        if ( indexFromIndex.isActive() &&
+                 indexFromIndex.isAllowRecordScan() &&
+                 (ex.getCause() instanceof OnlineIndexerException)) {
+            // fallback to a records scan
+            if (LOGGER.isWarnEnabled()) {
+                final KeyValueLogMessage message =
+                        KeyValueLogMessage.build("fallback to records scan",
+                                LogMessageKeys.INDEX_NAME, index.getName());
+                LOGGER.warn(message.toString(), ex);
+            }
+            indexScanner = null;
+            indexFromIndex.setFallback(); // deactivate indexFromIndex for this session
+            return fallback.get();
+        }
+        throw FDBExceptions.wrapException(ex);
+    }
+
+    @Nonnull private OnlineIndexerByRecords getScannerByRecords() {
+        if (! (indexScanner instanceof OnlineIndexerByRecords)) { // this covers null pointer
+            indexScanner = new OnlineIndexerByRecords(common);
+        }
+        return (OnlineIndexerByRecords)indexScanner;
+    }
+
+    @Nonnull private OnlineIndexerByRecords getScannerByRecordsOrThrow() {
+        if (indexFromIndex.isActive()) {
+            throw new MetaDataException("indexFromIndex makes no sense here");
+        }
+        return getScannerByRecords();
+    }
+
+    @Nonnull private OnlineIndexerScanner getScanner() {
+        return indexFromIndex.isActive() ?
+               getScannerByIndex() :
+               getScannerByRecords();
     }
 
     /**
@@ -218,7 +252,6 @@ public class OnlineIndexer implements AutoCloseable {
         return common.getConfigLoaderInvocationCount();
     }
 
-
     /**
      * Get the current number of records to process in one transaction.
      * This may go up or down while {@link #runAsync(Function, BiFunction, BiConsumer, List)} is running, if there are failures committing or
@@ -226,12 +259,12 @@ public class OnlineIndexer implements AutoCloseable {
      * @return the current number of records to process in one transaction
      */
     public int getLimit() {
-        return indexScanner == null ? common.getMaxLimit() : indexScanner.getLimit();
+        return getScanner().getLimit();
     }
 
     @SuppressWarnings("squid:S1452")
     private CompletableFuture<FDBRecordStore> openRecordStore(@Nonnull FDBRecordContext context) {
-        return recordStoreBuilder.copyBuilder().setContext(context).openAsync();
+        return common.openRecordStore(context);
     }
 
     @Override
@@ -262,41 +295,21 @@ public class OnlineIndexer implements AutoCloseable {
                                       @Nullable final BiConsumer<FDBException, List<Object>> handleLessenWork,
                                       @Nullable final List<Object> additionalLogMessageKeyValues) {
         // test only
-        return onlineIndexByRecordNewSane().runAsync(function, handlePostTransaction, handleLessenWork, additionalLogMessageKeyValues);
+        return getScanner().runAsync(function, handlePostTransaction, handleLessenWork, additionalLogMessageKeyValues);
     }
 
     @VisibleForTesting
     <R> CompletableFuture<R> buildAsync(@Nonnull BiFunction<FDBRecordStore, AtomicLong, CompletableFuture<R>> buildFunction,
-                                        boolean limitControl,
                                         @Nullable List<Object> additionalLogMessageKeyValues) {
         // test only
-        return onlineIndexByRecordNewSane().buildAsync(buildFunction, limitControl, additionalLogMessageKeyValues);
+        return getScanner().buildAsync(buildFunction, true, additionalLogMessageKeyValues);
     }
 
     @VisibleForTesting
     void decreaseLimit(@Nonnull FDBException fdbException,
                        @Nullable List<Object> additionalLogMessageKeyValues) {
-        limit = Math.max(1, (3 * limit) / 4);
-        if (LOGGER.isInfoEnabled()) {
-            final KeyValueLogMessage message = KeyValueLogMessage.build("Lessening limit of online index build",
-                                                LogMessageKeys.ERROR, fdbException.getMessage(),
-                                                LogMessageKeys.ERROR_CODE, fdbException.getCode(),
-                                                LogMessageKeys.LIMIT, limit);
-            if (additionalLogMessageKeyValues != null) {
-                message.addKeysAndValues(additionalLogMessageKeyValues);
-            }
-            LOGGER.info(message.toString(), fdbException);
-        }
-    }
-
-    @Nonnull private OnlineIndexerByRecords onlineIndexByRecordNewSane() {
-        if (indexFromIndex.isActive()) {
-            throw new MetaDataException("indexFromIndex makes no sense here");
-        }
-        if (! (indexScanner instanceof OnlineIndexerByRecords)) {
-            indexScanner = new OnlineIndexerByRecords(common);
-        }
-        return (OnlineIndexerByRecords)indexScanner;
+        // test only
+        getScanner().decreaseLimit(fdbException, additionalLogMessageKeyValues);
     }
 
     /**
@@ -319,7 +332,8 @@ public class OnlineIndexer implements AutoCloseable {
      */
     @Nonnull
     public CompletableFuture<Void> buildRange(@Nonnull FDBRecordStore store, @Nullable Key.Evaluated start, @Nullable Key.Evaluated end) {
-        return onlineIndexByRecordNewSane().buildRange(store, start, end);
+        // This only makes sense at 'scan by records' mode.
+        return getScannerByRecordsOrThrow().buildRange(store, start, end);
     }
 
     /**
@@ -342,7 +356,8 @@ public class OnlineIndexer implements AutoCloseable {
      */
     @Nonnull
     public CompletableFuture<Void> buildRange(@Nullable Key.Evaluated start, @Nullable Key.Evaluated end) {
-        return onlineIndexByRecordNewSane().buildRange(start, end);
+        // This only makes sense at 'scan by records' mode.
+        return getScannerByRecordsOrThrow().buildRange(start, end);
     }
 
     /**
@@ -378,13 +393,13 @@ public class OnlineIndexer implements AutoCloseable {
     public CompletableFuture<Key.Evaluated> buildUnbuiltRange(@Nonnull FDBRecordStore store,
                                                               @Nullable Key.Evaluated start,
                                                               @Nullable Key.Evaluated end) {
-        return onlineIndexByRecordNewSane().buildUnbuiltRange(store, start, end);
+        return getScannerByRecordsOrThrow().buildUnbuiltRange(store, start, end);
     }
 
     @VisibleForTesting
     @Nonnull
     CompletableFuture<Key.Evaluated> buildUnbuiltRange(@Nullable Key.Evaluated start, @Nullable Key.Evaluated end) {
-        return onlineIndexByRecordNewSane().buildUnbuiltRange(start, end);
+        return getScannerByRecordsOrThrow().buildUnbuiltRange(start, end);
     }
 
     /**
@@ -401,11 +416,9 @@ public class OnlineIndexer implements AutoCloseable {
      */
     @Nonnull
     public CompletableFuture<Void> rebuildIndexAsync(@Nonnull FDBRecordStore store) {
-        if (indexFromIndex.isActive()) {
-            return rebuildIndexAsyncByIndex(store);
-        } else {
-            return rebuildIndexAsyncByRecords(store);
-        }
+        return AsyncUtil.composeHandle( getScanner().rebuildIndexAsync(store),
+                (ignore, ex) ->
+                        handleScannerReturnOrFallback(ex, () -> getScanner().rebuildIndexAsync(store)));
     }
 
     /**
@@ -417,20 +430,6 @@ public class OnlineIndexer implements AutoCloseable {
      */
     public void rebuildIndex(@Nonnull FDBRecordStore store) {
         asyncToSync(FDBStoreTimer.Waits.WAIT_ONLINE_BUILD_INDEX, rebuildIndexAsync(store));
-    }
-
-    @Nonnull
-    private CompletableFuture<Void> rebuildIndexAsyncByRecords(@Nonnull FDBRecordStore store) {
-        indexScanner = new OnlineIndexerByRecords(common);
-        return indexScanner.rebuildIndexAsync(store);
-    }
-
-    @Nonnull
-    private CompletableFuture<Void> rebuildIndexAsyncByIndex(@Nonnull FDBRecordStore store) {
-        indexScanner = new OnlineIndexerByIndex(common, indexFromIndex);
-        return AsyncUtil.composeHandle( indexScanner.rebuildIndexAsync(store),
-                (ignore, ex) ->
-                        handleIndexFromIndexReturnOrFallback(ex, () -> rebuildIndexAsyncByRecords(store)));
     }
 
     /**
@@ -453,15 +452,8 @@ public class OnlineIndexer implements AutoCloseable {
      */
     @Nonnull
     public CompletableFuture<TupleRange> buildEndpoints(@Nonnull FDBRecordStore store) {
-        return buildEndpoints(store, null);
-    }
-
-    // just like the overload that doesn't take a recordsScanned
-    @Nonnull
-    private CompletableFuture<TupleRange> buildEndpoints(@Nonnull FDBRecordStore store,
-                                                         @Nullable AtomicLong recordsScanned) {
-        final OnlineIndexerByRecords scanner = new OnlineIndexerByRecords(common);
-        return scanner.buildEndpoints(store, recordsScanned);
+        // endpoints only make sense in 'scan by records' mode.
+        return getScannerByRecordsOrThrow().buildEndpoints(store, null);
     }
 
     /**
@@ -474,8 +466,7 @@ public class OnlineIndexer implements AutoCloseable {
      */
     @Nonnull
     public CompletableFuture<TupleRange> buildEndpoints() {
-        OnlineIndexerByRecords scanner = new OnlineIndexerByRecords(common);
-        return scanner.buildEndpoints();
+        return getScannerByRecordsOrThrow().buildEndpoints();
     }
 
     /**
@@ -561,45 +552,9 @@ public class OnlineIndexer implements AutoCloseable {
     @VisibleForTesting
     @Nonnull
     CompletableFuture<Void> buildIndexAsync(boolean markReadable) {
-
-        if (indexFromIndex.isActive()) {
-            return buildIndexAsyncByIndex(markReadable);
-        } else {
-            return buildIndexAsyncByRecords(markReadable);
-        }
-    }
-
-    @Nonnull
-    private CompletableFuture<Void> buildIndexAsyncByRecords(boolean markReadable) {
-        indexScanner = new OnlineIndexerByRecords(common);
-        return indexScanner.buildIndexAsync(markReadable, leaseLengthMills);
-    }
-
-    @Nonnull
-    private CompletableFuture<Void> buildIndexAsyncByIndex(boolean markReadable) {
-        indexScanner = new OnlineIndexerByIndex(common, indexFromIndex);
-        return AsyncUtil.composeHandle( indexScanner.buildIndexAsync(markReadable, leaseLengthMills),
+        return AsyncUtil.composeHandle(getScanner().buildIndexAsync(markReadable),
                 (ignore, ex) ->
-                        handleIndexFromIndexReturnOrFallback(ex, () -> buildIndexAsyncByRecords(markReadable)));
-    }
-
-    @Nonnull
-    private CompletableFuture<Void> handleIndexFromIndexReturnOrFallback(Throwable ex, Supplier<CompletableFuture<Void>> fallback) {
-        if (ex == null) {
-            return AsyncUtil.DONE;
-        }
-        if (indexFromIndex.isAllowRecordScan() &&
-                (ex.getCause() instanceof OnlineIndexerException)) {
-            // fallback to a records scan
-            if (LOGGER.isWarnEnabled()) {
-                final KeyValueLogMessage message =
-                        KeyValueLogMessage.build("fallback to records scan",
-                                LogMessageKeys.INDEX_NAME, index.getName());
-                LOGGER.warn(message.toString(), ex);
-            }
-            return fallback.get();
-        }
-        throw FDBExceptions.wrapException(ex);
+                        handleScannerReturnOrFallback(ex, () -> getScanner().buildIndexAsync(markReadable)));
     }
 
     @Nonnull
@@ -1739,6 +1694,7 @@ public class OnlineIndexer implements AutoCloseable {
         public static final IndexFromIndexPolicy INACTIVE = new IndexFromIndexPolicy();
         @Nullable private final String sourceIndex;
         private final boolean allowRecordScan;
+        private boolean fallback = false;
 
         /**
          * Build the index from a source index. Source index must be readable, idempotent, and fully cover the target index.
@@ -1763,7 +1719,14 @@ public class OnlineIndexer implements AutoCloseable {
          * @return True if active
          */
         public boolean isActive() {
-            return sourceIndex != null;
+            return sourceIndex != null && ! fallback;
+        }
+
+        /**
+         * Fallback is needed - deactivate indexFromIndex mode.
+         */
+        public void setFallback() {
+            fallback = true;
         }
 
         /**

@@ -1,5 +1,5 @@
 /*
- * OnlineIndexer.java
+ * OnlineIndexerCommon.java
  *
  * This source file is part of the FoundationDB open source project
  *
@@ -41,7 +41,7 @@ import java.util.function.Function;
  * Shared structure to be used (only) by the OnlineIndexer* modules.
  */
 public class OnlineIndexerCommon {
-    private UUID uuid = UUID.randomUUID();
+    private final UUID uuid = UUID.randomUUID();
 
     @Nonnull private final FDBDatabaseRunner runner;
     @Nullable private SynchronizedSessionRunner synchronizedSessionRunner = null;
@@ -54,12 +54,13 @@ public class OnlineIndexerCommon {
     private final boolean useSynchronizedSession;
     private final boolean syntheticIndex;
     private final boolean trackProgress;
+    private final long leaseLengthMillis;
 
     // This is bad: the config is imported from OnlineIndexer - a user of this module. How can we move
     // the Config definition here without breaking backward compatibility? Shall we create the class here
     // and let OnlineIndexer.Config inherit it?
     @Nonnull public OnlineIndexer.Config config; // may be modified on the fly
-    @Nonnull private final Function<OnlineIndexer.Config, OnlineIndexer.Config> configLoader;
+    @Nullable private final Function<OnlineIndexer.Config, OnlineIndexer.Config> configLoader;
     private int configLoaderInvocationCount = 0;
 
     @Nonnull public Collection<RecordType> recordTypes;
@@ -79,7 +80,8 @@ public class OnlineIndexerCommon {
                         boolean syntheticIndex,
                         @Nonnull IndexStatePrecondition indexStatePrecondition,
                         boolean trackProgress,
-                        boolean useSynchronizedSession
+                        boolean useSynchronizedSession,
+                        long leaseLengthMillis
 
     ) {
         this.useSynchronizedSession = useSynchronizedSession;
@@ -92,6 +94,7 @@ public class OnlineIndexerCommon {
         this.indexStatePrecondition = indexStatePrecondition;
         this.trackProgress = trackProgress;
         this.recordStoreBuilder = recordStoreBuilder;
+        this.leaseLengthMillis = leaseLengthMillis;
 
         this.totalRecordsScanned = new AtomicLong(0);
     }
@@ -170,6 +173,10 @@ public class OnlineIndexerCommon {
         return configLoaderInvocationCount;
     }
 
+    public long getLeaseLengthMillis() {
+        return leaseLengthMillis;
+    }
+
     public boolean loadConfig() {
         if (configLoader == null) {
             return false;
@@ -177,10 +184,6 @@ public class OnlineIndexerCommon {
         configLoaderInvocationCount++;
         config = configLoader.apply(config);
         return true;
-    }
-
-    public int getMaxLimit() {
-        return config.getMaxLimit();
     }
 
     @SuppressWarnings("squid:S1452")

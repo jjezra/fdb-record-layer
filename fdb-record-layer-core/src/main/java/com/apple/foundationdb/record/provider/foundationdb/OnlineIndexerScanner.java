@@ -1,5 +1,5 @@
 /*
- * OnlineIndexer.java
+ * OnlineIndexerScanner.java
  *
  * This source file is part of the FoundationDB open source project
  *
@@ -62,12 +62,10 @@ public abstract class OnlineIndexerScanner {
     private static final Logger LOGGER = LoggerFactory.getLogger(OnlineIndexerScanner.class);
     @Nonnull
     protected final OnlineIndexerCommon common; // to be used by extenders
-
-    private long timeOfLastProgressLogMillis = 0;
-
     @Nonnull
     private final OnlineIndexerThrottle throttle;
 
+    private long timeOfLastProgressLogMillis = 0;
 
     OnlineIndexerScanner(OnlineIndexerCommon common) {
         this.common = common;
@@ -78,7 +76,7 @@ public abstract class OnlineIndexerScanner {
         return common.getRunner();
     }
 
-    CompletableFuture<Void> buildIndexAsync(boolean markReadable, long leaseLengthMills) {
+    CompletableFuture<Void> buildIndexAsync(boolean markReadable) {
         KeyValueLogMessage message = KeyValueLogMessage.build("build index online",
                 LogMessageKeys.SHOULD_MARK_READABLE, markReadable);
         final CompletableFuture<Void> buildIndexAsyncFuture;
@@ -87,7 +85,7 @@ public abstract class OnlineIndexerScanner {
         if (common.isUseSynchronizedSession()) {
             buildIndexAsyncFuture = runner
                     .runAsync(context -> common.openRecordStore(context).thenApply(store -> OnlineIndexerCommon.indexBuildLockSubspace(store, index)))
-                    .thenCompose(lockSubspace -> runner.startSynchronizedSessionAsync(lockSubspace, leaseLengthMills))
+                    .thenCompose(lockSubspace -> runner.startSynchronizedSessionAsync(lockSubspace, common.getLeaseLengthMillis()))
                     .thenCompose(synchronizedRunner -> {
                         message.addKeyAndValue(LogMessageKeys.SESSION_ID, synchronizedRunner.getSessionId());
                         return runWithSynchronizedRunnerAndEndSession(synchronizedRunner,
@@ -213,7 +211,8 @@ public abstract class OnlineIndexerScanner {
         return true;
     }
 
-    protected int getLimit() {
+    public int getLimit() {
+        // made public to support tests
         return throttle.getLimit();
     }
 
@@ -224,8 +223,8 @@ public abstract class OnlineIndexerScanner {
         return MoreAsyncUtil.delayedFuture(toWait, TimeUnit.MILLISECONDS).thenApply(vignore3 -> true);
     }
 
-    @VisibleForTesting
-    <R> CompletableFuture<R> buildAsync(@Nonnull BiFunction<FDBRecordStore, AtomicLong, CompletableFuture<R>> buildFunction,
+
+    public <R> CompletableFuture<R> buildAsync(@Nonnull BiFunction<FDBRecordStore, AtomicLong, CompletableFuture<R>> buildFunction,
                                         boolean limitControl,
                                         @Nullable List<Object> additionalLogMessageKeyValues) {
 
@@ -326,16 +325,22 @@ public abstract class OnlineIndexerScanner {
 
     abstract CompletableFuture<Void> scanRebuildIndexAsync(FDBRecordStore store);
 
-    // runAsync
+    // test support
     @Nonnull
     @VisibleForTesting
     <R> CompletableFuture<R> runAsync(@Nonnull final Function<FDBRecordStore, CompletableFuture<R>> function,
                                       @Nonnull final BiFunction<R, Throwable, Pair<R, Throwable>> handlePostTransaction,
                                       @Nullable final BiConsumer<FDBException, List<Object>> handleLessenWork,
                                       @Nullable final List<Object> additionalLogMessageKeyValues) {
-        // for test only!
         return throttle.runAsync(function, handlePostTransaction, handleLessenWork, additionalLogMessageKeyValues);
     }
+
+    @VisibleForTesting
+    void decreaseLimit(@Nonnull FDBException fdbException,
+                       @Nullable List<Object> additionalLogMessageKeyValues) {
+        throttle.decreaseLimit(fdbException, additionalLogMessageKeyValues);
+    }
 }
+
 
 
