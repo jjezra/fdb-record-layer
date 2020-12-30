@@ -20,29 +20,15 @@
 
 package com.apple.foundationdb.record.provider.foundationdb;
 
-import com.apple.foundationdb.FDBError;
 import com.apple.foundationdb.FDBException;
-import com.apple.foundationdb.MutationType;
-import com.apple.foundationdb.Range;
-import com.apple.foundationdb.ReadTransactionContext;
 import com.apple.foundationdb.Transaction;
 import com.apple.foundationdb.annotation.API;
-import com.apple.foundationdb.async.AsyncIterator;
 import com.apple.foundationdb.async.AsyncUtil;
-import com.apple.foundationdb.async.MoreAsyncUtil;
 import com.apple.foundationdb.async.RangeSet;
-import com.apple.foundationdb.record.EndpointType;
-import com.apple.foundationdb.record.ExecuteProperties;
-import com.apple.foundationdb.record.IndexState;
-import com.apple.foundationdb.record.IsolationLevel;
 import com.apple.foundationdb.record.RecordCoreException;
-import com.apple.foundationdb.record.RecordCoreStorageException;
-import com.apple.foundationdb.record.RecordCursor;
-import com.apple.foundationdb.record.RecordCursorResult;
 import com.apple.foundationdb.record.RecordMetaData;
 import com.apple.foundationdb.record.RecordMetaDataProvider;
 import com.apple.foundationdb.record.RecordStoreState;
-import com.apple.foundationdb.record.ScanProperties;
 import com.apple.foundationdb.record.TupleRange;
 import com.apple.foundationdb.record.logging.KeyValueLogMessage;
 import com.apple.foundationdb.record.logging.LogMessageKeys;
@@ -53,13 +39,10 @@ import com.apple.foundationdb.record.metadata.RecordType;
 import com.apple.foundationdb.record.provider.common.RecordSerializer;
 import com.apple.foundationdb.record.provider.common.StoreTimer;
 import com.apple.foundationdb.record.provider.foundationdb.synchronizedsession.SynchronizedSessionRunner;
-import com.apple.foundationdb.record.query.plan.synthetic.SyntheticRecordFromStoredRecordPlan;
 import com.apple.foundationdb.record.query.plan.synthetic.SyntheticRecordPlanner;
 import com.apple.foundationdb.subspace.Subspace;
 import com.apple.foundationdb.synchronizedsession.SynchronizedSession;
-import com.apple.foundationdb.tuple.ByteArrayUtil2;
 import com.apple.foundationdb.tuple.Tuple;
-import com.apple.foundationdb.util.LoggableException;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.Message;
 import org.apache.commons.lang3.tuple.Pair;
@@ -68,22 +51,11 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
-import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Queue;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Function;
@@ -160,19 +132,7 @@ public class OnlineIndexer implements AutoCloseable {
      */
     public static final int DO_NOT_RE_INCREASE_LIMIT = -1;
 
-    @Nonnull private static final byte[] START_BYTES = new byte[]{0x00};
-    @Nonnull private static final byte[] END_BYTES = new byte[]{(byte)0xff};
     @Nonnull private static final Logger LOGGER = LoggerFactory.getLogger(OnlineIndexer.class);
-
-    // These error codes represent a list of errors that can occur if there is too much work to be done
-    // in a single transaction.
-    private static final Set<Integer> lessenWorkCodes = new HashSet<>(Arrays.asList(
-            FDBError.TIMED_OUT.code(),
-            FDBError.TRANSACTION_TOO_OLD.code(),
-            FDBError.NOT_COMMITTED.code(),
-            FDBError.TRANSACTION_TIMED_OUT.code(),
-            FDBError.COMMIT_READ_INCOMPLETE.code(),
-            FDBError.TRANSACTION_TOO_LARGE.code()));
 
     private static final Object INDEX_BUILD_LOCK_KEY = 0L;
     private static final Object INDEX_BUILD_SCANNED_RECORDS = 1L;
@@ -183,30 +143,19 @@ public class OnlineIndexer implements AutoCloseable {
     @Nonnull private final FDBDatabaseRunner runner;
     @Nonnull private final FDBRecordStore.Builder recordStoreBuilder;
     @Nonnull private final Index index;
-    @Nonnull private final Collection<RecordType> recordTypes;
 
     /**
      * The current number of records to process in a single transaction, this may go up or down when using
      * {@link #runAsync(Function, BiFunction, BiConsumer, List)}, but never above {@link Config#limit}.
      */
     private int limit;
-    @Nonnull private final Function<Config, Config> configLoader;
-    private int configLoaderInvocationCount = 0;
     @Nonnull private final IndexFromIndexPolicy indexFromIndex;
-    /**
-     * The number of successful transactions in a row as called by {@link #runAsync(Function, BiFunction, BiConsumer, List)}.
-     */
-    private int successCount;
-    private long timeOfLastProgressLogMillis;
     /**
      * The total number of records scanned in the build.
      * @see Builder#setProgressLogIntervalMillis(long)
      */
 
-    private final boolean syntheticIndex;
-
     private final long leaseLengthMills;
-    private final boolean trackProgress;
 
     @SuppressWarnings("squid:S00107")
     OnlineIndexer(@Nonnull FDBDatabaseRunner runner,
@@ -222,15 +171,9 @@ public class OnlineIndexer implements AutoCloseable {
         this.runner = runner;
         this.recordStoreBuilder = recordStoreBuilder;
         this.index = index;
-        this.recordTypes = recordTypes;
-        this.configLoader = configLoader;
         this.limit = config.getMaxLimit();
-        this.syntheticIndex = syntheticIndex;
         this.leaseLengthMills = leaseLengthMillis;
-        this.trackProgress = trackProgress;
         this.indexFromIndex = indexFromIndex;
-
-        timeOfLastProgressLogMillis = System.currentTimeMillis();
 
         this.common = new OnlineIndexerCommon(runner, recordStoreBuilder,
                 index, recordTypes, configLoader, config,
@@ -286,83 +229,9 @@ public class OnlineIndexer implements AutoCloseable {
         return indexScanner == null ? common.getMaxLimit() : indexScanner.getLimit();
     }
 
-    @Nonnull
-    private TupleRange computeRecordsRange() {
-        Tuple low = null;
-        Tuple high = null;
-        for (RecordType recordType : recordTypes) {
-            if (!recordType.primaryKeyHasRecordTypePrefix() || recordType.isSynthetic()) {
-                // If any of the types to build for does not have a prefix, give up.
-                return TupleRange.ALL;
-            }
-            Tuple prefix = recordType.getRecordTypeKeyTuple();
-            if (low == null) {
-                low = high = prefix;
-            } else {
-                if (low.compareTo(prefix) > 0) {
-                    low = prefix;
-                }
-                if (high.compareTo(prefix) < 0) {
-                    high = prefix;
-                }
-            }
-        }
-        if (low == null) {
-            return TupleRange.ALL;
-        } else {
-            // Both ends inclusive.
-            return new TupleRange(low, high, EndpointType.RANGE_INCLUSIVE, EndpointType.RANGE_INCLUSIVE);
-        }
-    }
-
-    // Finds the FDBException that ultimately caused some throwable or
-    // null if there is none. This can be then used to determine, for
-    // example, the error code associated with this FDBException.
-    @Nullable
-    private FDBException getFDBException(@Nullable Throwable e) {
-        Throwable curr = e;
-        while (curr != null) {
-            if (curr instanceof FDBException) {
-                return (FDBException)curr;
-            } else {
-                curr = curr.getCause();
-            }
-        }
-        return null;
-    }
-
-    // Turn a (possibly null) key into its tuple representation.
-    @Nullable
-    private Tuple convertOrNull(@Nullable Key.Evaluated key) {
-        return (key == null) ? null : key.toTuple();
-    }
-
-    // Turn a (possibly null) tuple into a (possibly null) byte array.
-    @Nullable
-    private byte[] packOrNull(@Nullable Tuple tuple) {
-        return (tuple == null) ? null : tuple.pack();
-    }
-
     @SuppressWarnings("squid:S1452")
     private CompletableFuture<FDBRecordStore> openRecordStore(@Nonnull FDBRecordContext context) {
         return recordStoreBuilder.copyBuilder().setContext(context).openAsync();
-    }
-
-    private void loadConfig() {
-        configLoaderInvocationCount++;
-        if (configLoader != null) {
-            common.config = configLoader.apply(common.config);
-            if (limit > common.config.getMaxLimit()) {
-                if (LOGGER.isInfoEnabled()) {
-                    LOGGER.info(
-                            KeyValueLogMessage.build("Decreasing the limit to the new maxLimit.",
-                                    LogMessageKeys.INDEX_NAME, index.getName(),
-                                    LogMessageKeys.LIMIT, limit,
-                                    LogMessageKeys.MAX_LIMIT, common.config.maxLimit).toString());
-                }
-                limit = common.config.maxLimit;
-            }
-        }
     }
 
     @Override
@@ -392,95 +261,16 @@ public class OnlineIndexer implements AutoCloseable {
                                       @Nonnull final BiFunction<R, Throwable, Pair<R, Throwable>> handlePostTransaction,
                                       @Nullable final BiConsumer<FDBException, List<Object>> handleLessenWork,
                                       @Nullable final List<Object> additionalLogMessageKeyValues) {
-        List<Object> onlineIndexerLogMessageKeyValues = new ArrayList<>(Arrays.asList(
-                LogMessageKeys.INDEX_NAME, index.getName(),
-                LogMessageKeys.INDEX_VERSION, index.getLastModifiedVersion(),
-                LogMessageKeys.INDEXER_ID, common.getUuid()));
-        if (additionalLogMessageKeyValues != null) {
-            onlineIndexerLogMessageKeyValues.addAll(additionalLogMessageKeyValues);
-        }
-
-        AtomicInteger tries = new AtomicInteger(0);
-        CompletableFuture<R> ret = new CompletableFuture<>();
-        AtomicLong toWait = new AtomicLong(FDBDatabaseFactory.instance().getInitialDelayMillis());
-        AsyncUtil.whileTrue(() -> {
-            loadConfig();
-            return getRunner().runAsync(context -> openRecordStore(context).thenCompose(store -> {
-                IndexState indexState = store.getIndexState(index);
-                if (indexState != IndexState.WRITE_ONLY) {
-                    throw new RecordCoreStorageException("Attempted to build non-write-only index",
-                            LogMessageKeys.INDEX_NAME, index.getName(),
-                            recordStoreBuilder.getSubspaceProvider().logKey(), recordStoreBuilder.getSubspaceProvider().toString(context),
-                            LogMessageKeys.INDEX_STATE, indexState);
-                }
-                return function.apply(store);
-            }), handlePostTransaction, onlineIndexerLogMessageKeyValues).handle((value, e) -> {
-                if (e == null) {
-                    ret.complete(value);
-                    return AsyncUtil.READY_FALSE;
-                } else {
-                    int currTries = tries.getAndIncrement();
-                    FDBException fdbE = getFDBException(e);
-                    if (currTries < common.config.maxRetries && fdbE != null && lessenWorkCodes.contains(fdbE.getCode())) {
-                        if (handleLessenWork != null) {
-                            handleLessenWork.accept(fdbE, onlineIndexerLogMessageKeyValues);
-                        }
-                        long delay = (long)(Math.random() * toWait.get());
-                        toWait.set(Math.min(toWait.get() * 2, FDBDatabaseFactory.instance().getMaxDelayMillis()));
-                        if (LOGGER.isWarnEnabled()) {
-                            final KeyValueLogMessage message = KeyValueLogMessage.build("Retrying Runner Exception",
-                                    LogMessageKeys.INDEXER_CURR_RETRY, currTries,
-                                    LogMessageKeys.INDEXER_MAX_RETRIES, common.config.maxRetries,
-                                    LogMessageKeys.DELAY, delay,
-                                    LogMessageKeys.LIMIT, limit);
-                            message.addKeysAndValues(onlineIndexerLogMessageKeyValues);
-                            LOGGER.warn(message.toString(), e);
-                        }
-                        return MoreAsyncUtil.delayedFuture(delay, TimeUnit.MILLISECONDS).thenApply(vignore3 -> true);
-                    } else {
-                        return completeExceptionally(ret, e, onlineIndexerLogMessageKeyValues);
-                    }
-                }
-            }).thenCompose(Function.identity());
-        }, getRunner().getExecutor()).whenComplete((vignore, e) -> {
-            if (e != null) {
-                // Just update ret and ignore the returned future.
-                completeExceptionally(ret, e, onlineIndexerLogMessageKeyValues);
-            }
-        });
-        return ret;
-    }
-
-    private <R> CompletableFuture<Boolean> completeExceptionally(CompletableFuture<R> ret, Throwable e, List<Object> additionalLogMessageKeyValues) {
-        if (e instanceof LoggableException) {
-            ((LoggableException)e).addLogInfo(additionalLogMessageKeyValues.toArray());
-        }
-        ret.completeExceptionally(getRunner().getDatabase().mapAsyncToSyncException(e));
-        return AsyncUtil.READY_FALSE;
+        // test only
+        return onlineIndexByRecordNewSane().runAsync(function, handlePostTransaction, handleLessenWork, additionalLogMessageKeyValues);
     }
 
     @VisibleForTesting
     <R> CompletableFuture<R> buildAsync(@Nonnull BiFunction<FDBRecordStore, AtomicLong, CompletableFuture<R>> buildFunction,
                                         boolean limitControl,
                                         @Nullable List<Object> additionalLogMessageKeyValues) {
-        AtomicLong recordsScanned = new AtomicLong(0);
-        return runAsync(store -> buildFunction.apply(store, recordsScanned),
-                // Run after a single transactional call within runAsync.
-                (result, exception) -> {
-                    if (limitControl) {
-                        tryToIncreaseLimit(exception);
-                    }
-                    // Update records scanned.
-                    if (exception == null) {
-                        common.getTotalRecordsScanned().addAndGet(recordsScanned.get());
-                    } else {
-                        recordsScanned.set(0);
-                    }
-                    return Pair.of(result, exception);
-                },
-                limitControl ? this::decreaseLimit : null,
-                additionalLogMessageKeyValues
-        );
+        // test only
+        return onlineIndexByRecordNewSane().buildAsync(buildFunction, limitControl, additionalLogMessageKeyValues);
     }
 
     @VisibleForTesting
@@ -499,184 +289,14 @@ public class OnlineIndexer implements AutoCloseable {
         }
     }
 
-    private void tryToIncreaseLimit(@Nullable Throwable exception) {
-        if (common.config.increaseLimitAfter > 0) {
-            if (exception == null) {
-                successCount++;
-                if (successCount >= common.config.increaseLimitAfter && limit < common.config.maxLimit) {
-                    increaseLimit();
-                }
-            } else {
-                successCount = 0;
-            }
+    @Nonnull private OnlineIndexerByRecords onlineIndexByRecordNewSane() {
+        if (indexFromIndex.isActive()) {
+            throw new MetaDataException("indexFromIndex makes no sense here");
         }
-    }
-
-    private void increaseLimit() {
-        limit = Math.min(common.config.maxLimit, Math.max(limit + 1, (4 * limit) / 3));
-        if (LOGGER.isInfoEnabled()) {
-            LOGGER.info(KeyValueLogMessage.of("Re-increasing limit of online index build",
-                            LogMessageKeys.INDEX_NAME, index.getName(),
-                            LogMessageKeys.INDEX_VERSION, index.getLastModifiedVersion(),
-                            LogMessageKeys.LIMIT, limit));
+        if (! (indexScanner instanceof OnlineIndexerByRecords)) {
+            indexScanner = new OnlineIndexerByRecords(common);
         }
-    }
-
-    // Builds the index for all of the keys within a given range. This does not update the range set
-    // associated with this index, so it is really designed to be a helper for other methods.
-    @Nonnull
-    private CompletableFuture<Tuple> buildRangeOnly(@Nonnull FDBRecordStore store,
-                                                    @Nullable Tuple start, @Nullable Tuple end,
-                                                    boolean respectLimit, @Nullable AtomicLong recordsScanned) {
-        return buildRangeOnly(store, TupleRange.between(start, end), respectLimit, recordsScanned)
-                .thenApply(realEnd -> realEnd == null ? end : realEnd);
-    }
-
-    // TupleRange version of above.
-    @Nonnull
-    private CompletableFuture<Tuple> buildRangeOnly(@Nonnull FDBRecordStore store, @Nonnull TupleRange range,
-                                                    boolean respectLimit, @Nullable AtomicLong recordsScanned) {
-        final Subspace scannedRecordsSubspace = indexBuildScannedRecordsSubspace(store, index);
-        if (store.getRecordMetaData() != recordStoreBuilder.getMetaDataProvider().getRecordMetaData()) {
-            throw new MetaDataException("Store does not have the same metadata");
-        }
-        final IndexMaintainer maintainer = store.getIndexMaintainer(index);
-        final boolean isIdempotent = maintainer.isIdempotent();
-        final ExecuteProperties.Builder executeProperties = ExecuteProperties.newBuilder()
-                .setIsolationLevel(
-                        isIdempotent ?
-                        IsolationLevel.SNAPSHOT :
-                        IsolationLevel.SERIALIZABLE);
-        if (respectLimit) {
-            executeProperties.setReturnedRowLimit(limit);
-        }
-        final ScanProperties scanProperties = new ScanProperties(executeProperties.build());
-        final RecordCursor<FDBStoredRecord<Message>> cursor = store.scanRecords(range, null, scanProperties);
-        final AtomicBoolean empty = new AtomicBoolean(true);
-        final FDBStoreTimer timer = getRunner().getTimer();
-
-        final SyntheticRecordFromStoredRecordPlan syntheticPlan;
-        if (syntheticIndex) {
-            // Need to do this each transaction because other index enabled state might have changed. Could cache based on that.
-            // Copying the state also guards against changes made by other online building from check version.
-            // TODO: need some state to avoid generating the same synthetic record via more than one self-join path for non-idempotent indexes.
-            final SyntheticRecordPlanner syntheticPlanner = new SyntheticRecordPlanner(store.getRecordMetaData(), store.getRecordStoreState().withWriteOnlyIndexes(Collections.singletonList(index.getName())));
-            syntheticPlan = syntheticPlanner.forIndex(index);
-        } else {
-            syntheticPlan = null;
-        }
-
-        AtomicLong recordsScannedCounter = new AtomicLong();
-        // Note: This runs all of the updates in serial in order to not invoke a race condition
-        // in the rank code that was causing incorrect results. If everything were thread safe,
-        // a larger pipeline size would be possible.
-
-        final AtomicReference<RecordCursorResult<FDBStoredRecord<Message>>> lastResult = new AtomicReference<>(RecordCursorResult.exhausted());
-        final FDBRecordContext context = store.getContext();
-        return AsyncUtil.whileTrue(() -> cursor.onNext().thenCompose(result -> {
-            if (!result.hasNext()) {
-                // end of the cursor list
-                if (timer != null) {
-                    timer.increment(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RANGES_BY_COUNT);
-                }
-                lastResult.set(result);
-                return AsyncUtil.READY_FALSE;
-            }
-
-            final FDBStoredRecord<Message> rec = result.get();
-            empty.set(false);
-            if (timer != null) {
-                timer.increment(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RECORDS_SCANNED);
-            }
-            recordsScannedCounter.incrementAndGet();
-            if (!recordTypes.contains(rec.getRecordType())) {
-                // This record is not our type, swipe left
-                return AsyncUtil.READY_TRUE;
-            }
-            // add this index to the transaction
-            if (isIdempotent) {
-                store.addRecordReadConflict(rec.getPrimaryKey());
-            }
-            if (timer != null) {
-                timer.increment(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RECORDS_INDEXED);
-            }
-
-            final CompletableFuture<Void> updateMaintainer;
-            if (syntheticPlan == null) {
-                updateMaintainer = maintainer.update(null, rec);
-            } else {
-                // Pipeline size is 1, since not all maintainers are thread-safe.
-                updateMaintainer = syntheticPlan.execute(store, rec).forEachAsync(syntheticRecord -> maintainer.update(null, syntheticRecord), 1);
-            }
-
-            return updateMaintainer.thenCompose(vignore ->
-                    context.getApproximateTransactionSize().thenApply(size -> {
-                        if (size >= common.config.getMaxWriteLimitBytes()) {
-                            // the transaction becomes too big - stop iterating
-                            if (timer != null) {
-                                timer.increment(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RANGES_BY_SIZE);
-                            }
-                            lastResult.set(result);
-                            return false;
-                        }
-                        return true;
-                    }));
-
-        }), cursor.getExecutor()
-        ).thenCompose(vignore -> {
-            long recordsScannedInTransaction = recordsScannedCounter.get();
-            if (recordsScanned != null) {
-                recordsScanned.addAndGet(recordsScannedInTransaction);
-            }
-            if (trackProgress) {
-                store.context.ensureActive().mutate(MutationType.ADD, scannedRecordsSubspace.getKey(),
-                        FDBRecordStore.encodeRecordCount(recordsScannedInTransaction));
-            }
-            byte[] nextCont = empty.get() ? null : lastResult.get().getContinuation().toBytes();
-            if (nextCont == null) {
-                return CompletableFuture.completedFuture(null);
-            } else {
-                // Get the next record and return its primary key.
-                executeProperties.setReturnedRowLimit(1);
-                final ScanProperties scanProperties1 = new ScanProperties(executeProperties.build());
-                RecordCursor<FDBStoredRecord<Message>> nextCursor = store.scanRecords(range, nextCont, scanProperties1);
-                return nextCursor.onNext().thenApply(result -> {
-                    if (result.hasNext()) {
-                        FDBStoredRecord<Message> rec = result.get();
-                        return rec.getPrimaryKey();
-                    } else {
-                        return null;
-                    }
-                });
-            }
-        });
-    }
-
-    // Builds a range within a single transaction. It will look for the missing ranges within the given range and build those while
-    // updating the range set.
-    @Nonnull
-    private CompletableFuture<Void> buildRange(@Nonnull FDBRecordStore store, @Nullable Tuple start, @Nullable Tuple end,
-                                               @Nullable AtomicLong recordsScanned) {
-        RangeSet rangeSet = new RangeSet(store.indexRangeSubspace(index));
-        AsyncIterator<Range> ranges = rangeSet.missingRanges(store.ensureContextActive(), packOrNull(start), packOrNull(end)).iterator();
-        return ranges.onHasNext().thenCompose(hasAny -> {
-            if (hasAny) {
-                return AsyncUtil.whileTrue(() -> {
-                    Range range = ranges.next();
-                    Tuple rangeStart = Arrays.equals(range.begin, START_BYTES) ? null : Tuple.fromBytes(range.begin);
-                    Tuple rangeEnd = Arrays.equals(range.end, END_BYTES) ? null : Tuple.fromBytes(range.end);
-                    return CompletableFuture.allOf(
-                            // All of the requested range without limit.
-                            // In practice, this method works because it is only called for the endpoint ranges, which are empty and
-                            // one long, respectively.
-                            buildRangeOnly(store, rangeStart, rangeEnd, false, recordsScanned),
-                            rangeSet.insertRange(store.ensureContextActive(), range, true)
-                    ).thenCompose(vignore -> ranges.onHasNext());
-                }, store.getExecutor());
-            } else {
-                return AsyncUtil.DONE;
-            }
-        });
+        return (OnlineIndexerByRecords)indexScanner;
     }
 
     /**
@@ -699,32 +319,7 @@ public class OnlineIndexer implements AutoCloseable {
      */
     @Nonnull
     public CompletableFuture<Void> buildRange(@Nonnull FDBRecordStore store, @Nullable Key.Evaluated start, @Nullable Key.Evaluated end) {
-        RangeSet rangeSet = new RangeSet(store.indexRangeSubspace(index));
-        byte[] startBytes = packOrNull(convertOrNull(start));
-        byte[] endBytes = packOrNull(convertOrNull(end));
-        AsyncIterator<Range> ranges = rangeSet.missingRanges(store.ensureContextActive(), startBytes, endBytes).iterator();
-        return ranges.onHasNext().thenCompose(hasNext -> {
-            if (hasNext) {
-                return AsyncUtil.whileTrue(() -> {
-                    Range toBuild = ranges.next();
-                    Tuple startTuple = Tuple.fromBytes(toBuild.begin);
-                    Tuple endTuple = Arrays.equals(toBuild.end, END_BYTES) ? null : Tuple.fromBytes(toBuild.end);
-                    AtomicReference<Tuple> currStart = new AtomicReference<>(startTuple);
-                    return AsyncUtil.whileTrue(() ->
-                        // Bold claim: this will never cause a RecordBuiltRangeException because of transactions.
-                        buildUnbuiltRange(store, currStart.get(), endTuple, null).thenApply(realEnd -> {
-                            if (realEnd != null && !realEnd.equals(endTuple)) {
-                                currStart.set(realEnd);
-                                return true;
-                            } else {
-                                return false;
-                            }
-                        }), store.getExecutor()).thenCompose(vignore -> ranges.onHasNext());
-                }, store.getExecutor());
-            } else {
-                return AsyncUtil.DONE;
-            }
-        });
+        return onlineIndexByRecordNewSane().buildRange(store, start, end);
     }
 
     /**
@@ -747,122 +342,7 @@ public class OnlineIndexer implements AutoCloseable {
      */
     @Nonnull
     public CompletableFuture<Void> buildRange(@Nullable Key.Evaluated start, @Nullable Key.Evaluated end) {
-        return buildRange(recordStoreBuilder.getSubspaceProvider(), start, end);
-    }
-
-    @Nonnull
-    private CompletableFuture<Void> buildRange(@Nonnull SubspaceProvider subspaceProvider, @Nullable Key.Evaluated start, @Nullable Key.Evaluated end) {
-        return getRunner().runAsync(context -> context.getReadVersionAsync().thenCompose(vignore ->
-                subspaceProvider.getSubspaceAsync(context).thenCompose(subspace -> {
-                    RangeSet rangeSet = new RangeSet(subspace.subspace(Tuple.from(FDBRecordStore.INDEX_RANGE_SPACE_KEY, index.getSubspaceKey())));
-                    byte[] startBytes = packOrNull(convertOrNull(start));
-                    byte[] endBytes = packOrNull(convertOrNull(end));
-                    Queue<Range> rangeDeque = new ArrayDeque<>();
-                    ReadTransactionContext rtc = context.ensureActive();
-                    return rangeSet.missingRanges(rtc, startBytes, endBytes)
-                            .thenAccept(rangeDeque::addAll)
-                            .thenCompose(vignore2 -> buildRanges(subspaceProvider, subspace, rangeSet, rangeDeque));
-                })
-        ));
-    }
-
-    @Nonnull
-    private CompletableFuture<Void> buildRanges(SubspaceProvider subspaceProvider, @Nonnull Subspace subspace,
-                                                RangeSet rangeSet, Queue<Range> rangeDeque) {
-        return AsyncUtil.whileTrue(() -> {
-            if (rangeDeque.isEmpty()) {
-                return CompletableFuture.completedFuture(false); // We're done.
-            }
-            Range toBuild = rangeDeque.remove();
-
-            // This only works if the things included within the rangeSet are serialized Tuples.
-            Tuple startTuple = Tuple.fromBytes(toBuild.begin);
-            Tuple endTuple = Arrays.equals(toBuild.end, END_BYTES) ? null : Tuple.fromBytes(toBuild.end);
-            return buildUnbuiltRange(startTuple, endTuple)
-                    .handle((realEnd, ex) -> handleBuiltRange(subspaceProvider, subspace, rangeSet, rangeDeque, startTuple, endTuple, realEnd, ex))
-                    .thenCompose(Function.identity());
-        }, getRunner().getExecutor());
-    }
-
-    @Nonnull
-    private CompletableFuture<Boolean> handleBuiltRange(SubspaceProvider subspaceProvider, @Nonnull Subspace subspace,
-                                                        RangeSet rangeSet, Queue<Range> rangeDeque,
-                                                        Tuple startTuple, Tuple endTuple, Tuple realEnd,
-                                                        Throwable ex) {
-        final RuntimeException unwrappedEx = ex == null ? null : getRunner().getDatabase().mapAsyncToSyncException(ex);
-        long toWait = (common.config.recordsPerSecond == UNLIMITED) ? 0 : 1000 * limit / common.config.recordsPerSecond;
-        if (unwrappedEx == null) {
-            if (realEnd != null && !realEnd.equals(endTuple)) {
-                // We didn't make it to the end. Continue on to the next item.
-                if (endTuple != null) {
-                    rangeDeque.add(new Range(realEnd.pack(), endTuple.pack()));
-                } else {
-                    rangeDeque.add(new Range(realEnd.pack(), END_BYTES));
-                }
-            }
-            maybeLogBuildProgress(subspaceProvider, startTuple, endTuple, realEnd);
-            return MoreAsyncUtil.delayedFuture(toWait, TimeUnit.MILLISECONDS).thenApply(vignore3 -> true);
-        } else {
-            Throwable cause = unwrappedEx;
-            while (cause != null) {
-                if (cause instanceof RecordBuiltRangeException) {
-                    return rangeSet.missingRanges(getRunner().getDatabase().database(), startTuple.pack(), endTuple.pack())
-                            .thenCompose(list -> {
-                                rangeDeque.addAll(list);
-                                return MoreAsyncUtil.delayedFuture(toWait, TimeUnit.MILLISECONDS);
-                            }).thenApply(vignore3 -> true);
-                } else {
-                    cause = cause.getCause();
-                }
-            }
-            if (LOGGER.isInfoEnabled()) {
-                LOGGER.info(KeyValueLogMessage.of("possibly non-fatal error encountered building range",
-                        LogMessageKeys.RANGE_START, startTuple,
-                        LogMessageKeys.RANGE_END, endTuple,
-                        LogMessageKeys.SUBSPACE, ByteArrayUtil2.loggable(subspace.pack())), ex);
-            }
-            throw unwrappedEx; // made it to the bottom, throw original exception
-        }
-    }
-
-    private void maybeLogBuildProgress(SubspaceProvider subspaceProvider, Tuple startTuple, Tuple endTuple, Tuple realEnd) {
-        if (LOGGER.isInfoEnabled()
-                && (common.config.progressLogIntervalMillis > 0
-                    && System.currentTimeMillis() - timeOfLastProgressLogMillis > common.config.progressLogIntervalMillis)
-                || common.config.progressLogIntervalMillis == 0) {
-            LOGGER.info(KeyValueLogMessage.of("Built Range",
-                            LogMessageKeys.INDEX_NAME, index.getName(),
-                            LogMessageKeys.INDEX_VERSION, index.getLastModifiedVersion(),
-                            subspaceProvider.logKey(), subspaceProvider,
-                            LogMessageKeys.START_TUPLE, startTuple,
-                            LogMessageKeys.END_TUPLE, endTuple,
-                            LogMessageKeys.REAL_END, realEnd,
-                            LogMessageKeys.RECORDS_SCANNED, common.getTotalRecordsScanned().get()),
-                            LogMessageKeys.INDEXER_ID, common.getUuid());
-            timeOfLastProgressLogMillis = System.currentTimeMillis();
-        }
-    }
-
-    // Helper function that works on Tuples instead of keys.
-    @Nonnull
-    private CompletableFuture<Tuple> buildUnbuiltRange(@Nonnull FDBRecordStore store, @Nullable Tuple start,
-                                                       @Nullable Tuple end, @Nullable AtomicLong recordsScanned) {
-        CompletableFuture<Tuple> buildFuture = buildRangeOnly(store, start, end, true, recordsScanned);
-
-        RangeSet rangeSet = new RangeSet(store.indexRangeSubspace(index));
-        byte[] startBytes = packOrNull(start);
-
-        AtomicReference<Tuple> toReturn = new AtomicReference<>();
-        return buildFuture.thenCompose(realEnd -> {
-            toReturn.set(realEnd);
-            return rangeSet.insertRange(store.ensureContextActive(), startBytes, packOrNull(realEnd), true);
-        }).thenApply(changed -> {
-            if (changed) {
-                return toReturn.get();
-            } else {
-                throw new RecordBuiltRangeException(start, end);
-            }
-        });
+        return onlineIndexByRecordNewSane().buildRange(start, end);
     }
 
     /**
@@ -898,39 +378,13 @@ public class OnlineIndexer implements AutoCloseable {
     public CompletableFuture<Key.Evaluated> buildUnbuiltRange(@Nonnull FDBRecordStore store,
                                                               @Nullable Key.Evaluated start,
                                                               @Nullable Key.Evaluated end) {
-        return buildUnbuiltRange(store, start, end, null);
-    }
-
-    // just like the overload that doesn't take a recordsScanned
-    @Nonnull
-    private CompletableFuture<Key.Evaluated> buildUnbuiltRange(@Nonnull FDBRecordStore store,
-                                                               @Nullable Key.Evaluated start, @Nullable Key.Evaluated end,
-                                                               @Nullable AtomicLong recordsScanned) {
-        return buildUnbuiltRange(store, convertOrNull(start), convertOrNull(end), recordsScanned)
-                .thenApply(tuple -> (tuple == null) ? null : Key.Evaluated.fromTuple(tuple));
-    }
-
-    // Helper function with the same behavior as buildUnbuiltRange, but it works on tuples instead of primary keys.
-    @Nonnull
-    private CompletableFuture<Tuple> buildUnbuiltRange(@Nullable Tuple start, @Nullable Tuple end) {
-        final List<Object> additionalLogMessageKeyValues = Arrays.asList(LogMessageKeys.CALLING_METHOD, "buildUnbuiltRange",
-                LogMessageKeys.RANGE_START, start,
-                LogMessageKeys.RANGE_END, end);
-
-        return buildAsync((store, recordsScanned) -> buildUnbuiltRange(store, start, end, recordsScanned),
-                true,
-                additionalLogMessageKeyValues);
+        return onlineIndexByRecordNewSane().buildUnbuiltRange(store, start, end);
     }
 
     @VisibleForTesting
     @Nonnull
     CompletableFuture<Key.Evaluated> buildUnbuiltRange(@Nullable Key.Evaluated start, @Nullable Key.Evaluated end) {
-        final List<Object> additionalLogMessageKeyValues = Arrays.asList(LogMessageKeys.CALLING_METHOD, "buildUnbuiltRange",
-                LogMessageKeys.RANGE_START, start,
-                LogMessageKeys.RANGE_END, end);
-        return buildAsync((store, recordsScanned) -> buildUnbuiltRange(store, start, end, recordsScanned),
-                true,
-                additionalLogMessageKeyValues);
+        return onlineIndexByRecordNewSane().buildUnbuiltRange(start, end);
     }
 
     /**

@@ -20,6 +20,7 @@
 
 package com.apple.foundationdb.record.provider.foundationdb;
 
+import com.apple.foundationdb.FDBException;
 import com.apple.foundationdb.Transaction;
 import com.apple.foundationdb.async.AsyncUtil;
 import com.apple.foundationdb.async.MoreAsyncUtil;
@@ -35,6 +36,7 @@ import com.apple.foundationdb.record.provider.foundationdb.synchronizedsession.S
 import com.apple.foundationdb.record.query.plan.synthetic.SyntheticRecordFromStoredRecordPlan;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.Message;
+import org.apache.commons.lang3.tuple.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,6 +47,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -63,7 +66,7 @@ public abstract class OnlineIndexerScanner {
     private long timeOfLastProgressLogMillis = 0;
 
     @Nonnull
-    private final OnlineIndexerThrottle throttle ;
+    private final OnlineIndexerThrottle throttle;
 
 
     OnlineIndexerScanner(OnlineIndexerCommon common) {
@@ -236,10 +239,10 @@ public abstract class OnlineIndexerScanner {
         }
     }
 
-    private static CompletableFuture<Void> updateMaintainerBuilder( SyntheticRecordFromStoredRecordPlan syntheticPlan,
-                                                             FDBStoredRecord<Message> rec,
-                                                             IndexMaintainer maintainer,
-                                                             FDBRecordStore store) {
+    private static CompletableFuture<Void> updateMaintainerBuilder(SyntheticRecordFromStoredRecordPlan syntheticPlan,
+                                                                   FDBStoredRecord<Message> rec,
+                                                                   IndexMaintainer maintainer,
+                                                                   FDBRecordStore store) {
         // helper function to reduce complexity
         if (syntheticPlan == null) {
             return maintainer.update(null, rec);
@@ -254,7 +257,7 @@ public abstract class OnlineIndexerScanner {
                                                        @Nonnull Consumer<RecordCursorResult<?>> lastResultSet,
                                                        AtomicBoolean isEmpty,
                                                        AtomicLong recordsScannedCounter
-                                                       ) {
+    ) {
         final FDBStoreTimer timer = getRunner().getTimer();
         final Index index = common.getIndex();
         final IndexMaintainer maintainer = store.getIndexMaintainer(index);
@@ -322,5 +325,17 @@ public abstract class OnlineIndexerScanner {
     }
 
     abstract CompletableFuture<Void> scanRebuildIndexAsync(FDBRecordStore store);
+
+    // runAsync
+    @Nonnull
+    @VisibleForTesting
+    <R> CompletableFuture<R> runAsync(@Nonnull final Function<FDBRecordStore, CompletableFuture<R>> function,
+                                      @Nonnull final BiFunction<R, Throwable, Pair<R, Throwable>> handlePostTransaction,
+                                      @Nullable final BiConsumer<FDBException, List<Object>> handleLessenWork,
+                                      @Nullable final List<Object> additionalLogMessageKeyValues) {
+        // for test only!
+        return throttle.runAsync(function, handlePostTransaction, handleLessenWork, additionalLogMessageKeyValues);
+    }
 }
+
 
