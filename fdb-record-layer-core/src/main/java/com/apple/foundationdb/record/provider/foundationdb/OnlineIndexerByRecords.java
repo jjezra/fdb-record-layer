@@ -152,6 +152,7 @@ public class OnlineIndexerByRecords extends OnlineIndexerScanner {
      * in parallel if one desires.
      *
      * @param store the record store in which to rebuild the index
+     * @param recordsScanned continues counter
      * @return a future that will contain the range of records in the interior of the record store
      */
 

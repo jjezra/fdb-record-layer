@@ -21,7 +21,6 @@
 package com.apple.foundationdb.record.provider.foundationdb;
 
 import com.apple.foundationdb.FDBException;
-import com.apple.foundationdb.Transaction;
 import com.apple.foundationdb.annotation.API;
 import com.apple.foundationdb.async.AsyncUtil;
 import com.apple.foundationdb.async.RangeSet;
@@ -473,7 +472,7 @@ public class OnlineIndexer implements AutoCloseable {
      * Stop any ongoing online index build (only if it uses {@link SynchronizedSession}s) by forcefully releasing
      * the lock.
      * @return a future that will be ready when the lock is released
-     * @see SynchronizedSession#endAnySession(Transaction, Subspace)
+     * @see SynchronizedSession#endAnySession
      */
     public CompletableFuture<Void> stopOngoingOnlineIndexBuildsAsync() {
         return runner.runAsync(context -> openRecordStore(context).thenAccept(recordStore ->
