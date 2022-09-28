@@ -149,7 +149,7 @@ public class IndexingCommon {
         return uuid;
     }
 
-    public boolean isUseSynchronizedSession() {
+    public boolean shouldUseSynchronizedSession() {
         return useSynchronizedSession;
     }
 

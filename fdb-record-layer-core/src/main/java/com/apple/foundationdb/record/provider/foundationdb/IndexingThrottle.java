@@ -28,7 +28,6 @@ import com.apple.foundationdb.record.IndexState;
 import com.apple.foundationdb.record.RecordCoreStorageException;
 import com.apple.foundationdb.record.logging.KeyValueLogMessage;
 import com.apple.foundationdb.record.logging.LogMessageKeys;
-import com.apple.foundationdb.record.metadata.Index;
 import com.apple.foundationdb.record.provider.foundationdb.runners.ExponentialDelay;
 import com.apple.foundationdb.util.LoggableException;
 import org.apache.commons.lang3.tuple.Pair;
@@ -48,6 +47,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * This class provides build/commit/retry with throttling to the OnlineIndexer. In the future,
@@ -196,20 +196,22 @@ public class IndexingThrottle {
 
         AtomicInteger tries = new AtomicInteger(0);
         CompletableFuture<R> ret = new CompletableFuture<>();
-        final ExponentialDelay delay = new ExponentialDelay(common.getRunner().getDatabase().getFactory().getInitialDelayMillis(),
-                common.getRunner().getDatabase().getFactory().getMaxDelayMillis());
         AsyncUtil.whileTrue(() -> {
             loadConfig();
             return common.getRunner().runAsync(context -> common.getRecordStoreBuilder().copyBuilder().setContext(context).openAsync().thenCompose(store -> {
-                for (Index index: common.getTargetIndexes()) {
-                    IndexState indexState = store.getIndexState(index);
-                    if (indexState != expectedIndexState) {
-                        throw new RecordCoreStorageException("Unexpected index state",
-                                LogMessageKeys.INDEX_NAME, index.getName(),
-                                common.getRecordStoreBuilder().getSubspaceProvider().logKey(), common.getRecordStoreBuilder().getSubspaceProvider().toString(context),
-                                LogMessageKeys.INDEX_STATE, indexState,
-                                LogMessageKeys.INDEX_STATE_PRECONDITION, expectedIndexState);
+                List<IndexState> indexStates = common.getTargetIndexes().stream().map(store::getIndexState).collect(Collectors.toList());
+                if (indexStates.stream().anyMatch(state -> state != expectedIndexState)) {
+                    if (indexStates.stream().allMatch(state -> state == IndexState.READABLE)) {
+                        throw new IndexingBase.UnexpectedReadableException(true, "All indexes are built");
                     }
+                    if (indexStates.stream().allMatch(state -> state == expectedIndexState || state == IndexState.READABLE)) {
+                        throw new IndexingBase.UnexpectedReadableException(false, "Some indexes are built");
+                    }
+                    throw new RecordCoreStorageException("Unexpected index state(s)",
+                            common.getRecordStoreBuilder().getSubspaceProvider().logKey(), common.getRecordStoreBuilder().getSubspaceProvider().toString(context),
+                            LogMessageKeys.INDEX_NAME, common.getTargetIndexesNames(),
+                            LogMessageKeys.INDEX_STATE, indexStates,
+                            LogMessageKeys.INDEX_STATE_PRECONDITION, expectedIndexState);
                 }
                 return function.apply(store);
             }), handlePostTransaction, onlineIndexerLogMessageKeyValues).handle((value, e) -> {
@@ -223,6 +225,8 @@ public class IndexingThrottle {
                         if (handleLessenWork != null) {
                             handleLessenWork.accept(fdbE, onlineIndexerLogMessageKeyValues);
                         }
+                        final ExponentialDelay delay = new ExponentialDelay(common.getRunner().getDatabase().getFactory().getInitialDelayMillis(),
+                                common.getRunner().getDatabase().getFactory().getMaxDelayMillis());
                         if (LOGGER.isWarnEnabled()) {
                             final KeyValueLogMessage message = KeyValueLogMessage.build("Retrying Runner Exception",
                                     LogMessageKeys.INDEXER_CURR_RETRY, currTries,

@@ -172,7 +172,7 @@ public abstract class IndexingBase {
 
     // buildIndexAsync - the main indexing function. Builds and commits indexes asynchronously; throttling to avoid overloading the system.
     @SuppressWarnings("PMD.CloseResource")
-    public CompletableFuture<Void> buildIndexAsync(boolean markReadable) {
+    public CompletableFuture<Void> buildIndexAsync(boolean markReadable, boolean useSyncLock) {
         KeyValueLogMessage message = KeyValueLogMessage.build("build index online",
                 LogMessageKeys.SHOULD_MARK_READABLE, markReadable)
                 .addKeysAndValues(indexingLogMessageKeyValues())
@@ -180,7 +180,7 @@ public abstract class IndexingBase {
         final CompletableFuture<Void> buildIndexAsyncFuture;
         FDBDatabaseRunner runner = common.getRunner();
         Index index = common.getPrimaryIndex();
-        if (common.isUseSynchronizedSession()) {
+        if (useSyncLock) {
             buildIndexAsyncFuture = runner
                     .runAsync(context -> openRecordStore(context).thenApply(store -> indexBuildLockSubspace(store, index)),
                             common.indexLogMessageKeyValues("IndexingBase::indexBuildLockSubspace"))
@@ -282,7 +282,7 @@ public abstract class IndexingBase {
             List<Index> indexesToClear = new ArrayList<>(targetIndexes.size());
             if (shouldClear) {
                 indexesToClear.add(primaryIndex);
-                forceStampOverwrite = true; // The code can work without this line, but it'll save probing the missing ranges
+                enforceStampOverwrite(); // The code can work without this line, but it'll save probing the missing ranges
             }
 
             boolean continuedBuild = !shouldClear && indexState == IndexState.WRITE_ONLY;
@@ -430,9 +430,7 @@ public abstract class IndexingBase {
                         // A matching stamp is already there - One less thing to worry about
                         return AsyncUtil.DONE;
                     }
-                    if (continuedBuild &&
-                            indexingTypeStamp.getMethod() == IndexBuildProto.IndexBuildIndexingStamp.Method.BY_RECORDS &&
-                            savedStamp.getMethod() == IndexBuildProto.IndexBuildIndexingStamp.Method.MULTI_TARGET_BY_RECORDS) {
+                    if (continuedBuild && shouldAllowTakeoverContinue(indexingTypeStamp, savedStamp)) {
                         // Special case: partly built with multi target, but may be continued indexing on its own
                         store.saveIndexingTypeStamp(index, indexingTypeStamp);
                         return AsyncUtil.DONE;
@@ -447,6 +445,14 @@ public abstract class IndexingBase {
                     // fall down to exception
                     throw newPartlyBuildException(continuedBuild, savedStamp, indexingTypeStamp, index);
                 });
+    }
+
+    private boolean shouldAllowTakeoverContinue(IndexBuildProto.IndexBuildIndexingStamp newStamp, IndexBuildProto.IndexBuildIndexingStamp savedStamp) {
+        return policy.shouldAllowTakeoverContinue() &&
+               (newStamp.getMethod() == IndexBuildProto.IndexBuildIndexingStamp.Method.BY_RECORDS &&
+                savedStamp.getMethod() == IndexBuildProto.IndexBuildIndexingStamp.Method.MULTI_TARGET_BY_RECORDS) ||
+               (newStamp.getMethod() == IndexBuildProto.IndexBuildIndexingStamp.Method.BY_RECORDS &&
+               savedStamp.getMethod() == IndexBuildProto.IndexBuildIndexingStamp.Method.MUTUAL_BY_RECORDS);
     }
 
     @Nonnull
@@ -907,7 +913,7 @@ public abstract class IndexingBase {
     }
 
     /**
-     * thrown when IndexFromIndex validation fails.
+     * thrown when partly built by another method.
      */
     @SuppressWarnings("serial")
     public static class  PartlyBuiltException extends RecordCoreException {
@@ -920,11 +926,33 @@ public abstract class IndexingBase {
     }
 
     public static PartlyBuiltException getAPartlyBuildExceptionIfApplicable(@Nullable Throwable ex) {
+        return (PartlyBuiltException) findException(ex, PartlyBuiltException.class);
+    }
+
+    /**
+     * thrown when all indexes to build became readable (maybe by another process).
+     */
+    @SuppressWarnings("serial")
+    public static class UnexpectedReadableException extends RecordCoreException {
+        final boolean allReadable;
+
+        public UnexpectedReadableException(boolean allReadable, @Nonnull String msg, @Nullable Object ... keyValues) {
+            super(msg, keyValues);
+            this.allReadable = allReadable;
+        }
+    }
+
+    public static UnexpectedReadableException getUnexpectedReadableIfApplicable(@Nullable Throwable ex) {
+        return (UnexpectedReadableException) findException(ex, UnexpectedReadableException.class);
+    }
+
+    private static <T> Throwable findException(@Nullable Throwable ex, Class<T> classT) {
+        int allowedDepth = 20;
         for (Throwable current = ex;
-                current != null;
-                current = current.getCause()) {
-            if (current instanceof PartlyBuiltException) {
-                return (PartlyBuiltException) current;
+                current != null && allowedDepth > 0;
+                current = current.getCause(), allowedDepth --) {
+            if (classT.isInstance(current)) {
+                return current;
             }
         }
         return null;

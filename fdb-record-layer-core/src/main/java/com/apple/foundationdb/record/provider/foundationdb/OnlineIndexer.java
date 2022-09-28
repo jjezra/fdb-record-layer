@@ -303,6 +303,19 @@ public class OnlineIndexer implements AutoCloseable {
             }
         }
 
+        if (indexingPolicy.isMutual()) {
+            IndexingBase.UnexpectedReadableException unexpectedReadableException = IndexingBase.getUnexpectedReadableIfApplicable(ex);
+            if (unexpectedReadableException != null) {
+                if (unexpectedReadableException.allReadable) {
+                    // All are readable
+                    return AsyncUtil.DONE;
+                }
+                // Some are readable, probably by another process. Call regular indexing to check/mark readable
+                fallbackToRecordsScan = true;
+                return indexingLauncher(indexingFunc, attemptCount);
+            }
+        }
+
         // No handling, throw the error.
         throw FDBExceptions.wrapException(ex);
     }
@@ -344,7 +357,18 @@ public class OnlineIndexer implements AutoCloseable {
     }
 
     @Nonnull
+    private IndexingMutuallyByRecords getMutualIndexerByRecords() {
+        if (! (indexer instanceof IndexingMutuallyByRecords)) {
+            indexer = new IndexingMutuallyByRecords(common, indexingPolicy, indexingPolicy.mutualIndexingBoundaries);
+        }
+        return (IndexingMutuallyByRecords)indexer;
+    }
+
+    @Nonnull
     private IndexingBase getIndexer() {
+        if (indexingPolicy.isMutual() && !fallbackToRecordsScan) {
+            return getMutualIndexerByRecords();
+        }
         if (indexingPolicy.isByIndex() && !common.isMultiTarget() && !fallbackToRecordsScan) {
             return getIndexerByIndex();
         }
@@ -705,7 +729,8 @@ public class OnlineIndexer implements AutoCloseable {
     @VisibleForTesting
     @Nonnull
     CompletableFuture<Void> buildIndexAsync(boolean markReadable) {
-        return indexingLauncher(() -> getIndexer().buildIndexAsync(markReadable));
+        boolean useSyncLock = (!indexingPolicy.isMutual() || fallbackToRecordsScan) && common.shouldUseSynchronizedSession();
+        return indexingLauncher(() -> getIndexer().buildIndexAsync(markReadable, useSyncLock));
     }
 
     @Nonnull
@@ -741,14 +766,14 @@ public class OnlineIndexer implements AutoCloseable {
     }
 
     @VisibleForTesting
-    private CompletableFuture<Void> buildIndexAsyncSingleTarget(boolean markReadable) {
+    private CompletableFuture<Void> buildIndexAsyncSingleTarget() {
         // Testing only - enforce the old by-records indexer
-        return indexingLauncher(() -> getIndexerByRecordsOrThrow().buildIndexAsync(markReadable));
+        return indexingLauncher(() -> getIndexerByRecordsOrThrow().buildIndexAsync(true, common.shouldUseSynchronizedSession()));
     }
 
     @VisibleForTesting
     protected void buildIndexSingleTarget() {
-        asyncToSync(FDBStoreTimer.Waits.WAIT_ONLINE_BUILD_INDEX, buildIndexAsyncSingleTarget(true));
+        asyncToSync(FDBStoreTimer.Waits.WAIT_ONLINE_BUILD_INDEX, buildIndexAsyncSingleTarget());
     }
 
     /**
@@ -1925,13 +1950,13 @@ public class OnlineIndexer implements AutoCloseable {
 
         private void validate() {
             final RecordMetaData metaData = getRecordMetaData();
-            validateIndexes(metaData);
+            validateIndexSetting(metaData);
             validateTypes(metaData);
             validateLimits();
         }
 
         @SuppressWarnings("PMD.CompareObjectsWithEquals")
-        private void validateIndexes(RecordMetaData metaData) {
+        private void validateIndexSetting(RecordMetaData metaData) {
             if (this.targetIndexes.isEmpty()) {
                 throw new MetaDataException("index must be set");
             }
@@ -1945,6 +1970,9 @@ public class OnlineIndexer implements AutoCloseable {
                 if (set.size() < targetIndexes.size()) {
                     targetIndexes = new ArrayList<>(set);
                 }
+            }
+            if (indexingPolicy.isMutual() && indexingPolicy.isByIndex()) {
+                throw new IndexingBase.ValidationException("Indexing mutually by a source index is not supported (yet)");
             }
             targetIndexes.sort(Comparator.comparing(Index::getName));
             for (Index index : targetIndexes) {
@@ -1992,6 +2020,9 @@ public class OnlineIndexer implements AutoCloseable {
         private final DesiredAction ifMismatchPrevious;
         private final DesiredAction ifReadable;
         private final boolean allowUniquePendingState;
+        private final boolean allowTakeoverContinue;
+        private final boolean mutualIndexing;
+        private final List<Tuple> mutualIndexingBoundaries;
 
         /**
          * Possible actions when an index is already partially built.
@@ -2013,11 +2044,14 @@ public class OnlineIndexer implements AutoCloseable {
          * @param ifMismatchPrevious desired action if the index is partly built, but by a different method then currently requested
          * @param ifReadable desired action if the existing index state is READABLE (i.e. already built)
          * @param allowUniquePendingState if false, forbid {@link IndexState#READABLE_UNIQUE_PENDING} state.
+         * @param mutualIndexing if true, use mutual indexing (i.e., index in a way that allows other processes to cooperatively build the index)
+         * @param mutualIndexingBoundaries if present, use this predefined list of ranges. Else, split ranges by shards.
          */
         @SuppressWarnings("squid:S00107") // too many parameters
         public IndexingPolicy(@Nullable String sourceIndex, @Nullable Object sourceIndexSubspaceKey, boolean forbidRecordScan,
                               DesiredAction ifDisabled, DesiredAction ifWriteOnly, DesiredAction ifMismatchPrevious, DesiredAction ifReadable,
-                              boolean allowUniquePendingState) {
+                              boolean allowUniquePendingState, boolean allowTakeoverContinue,
+                              boolean mutualIndexing, List<Tuple> mutualIndexingBoundaries) {
             this.sourceIndex = sourceIndex;
             this.forbidRecordScan = forbidRecordScan;
             this.sourceIndexSubspaceKey = sourceIndexSubspaceKey;
@@ -2026,6 +2060,9 @@ public class OnlineIndexer implements AutoCloseable {
             this.ifMismatchPrevious = ifMismatchPrevious;
             this.ifReadable = ifReadable;
             this.allowUniquePendingState = allowUniquePendingState;
+            this.allowTakeoverContinue = allowTakeoverContinue;
+            this.mutualIndexing = mutualIndexing;
+            this.mutualIndexingBoundaries = mutualIndexingBoundaries;
         }
 
         /**
@@ -2059,6 +2096,14 @@ public class OnlineIndexer implements AutoCloseable {
         }
 
         /**
+         * In this mode, assume concurrently indexing with other entities.
+         * @return true if mutual
+         */
+        public boolean isMutual() {
+            return mutualIndexing;
+        }
+
+        /**
          * Create an indexing policy builder.
          * @return a new {@link IndexingPolicy} builder
          */
@@ -2080,7 +2125,12 @@ public class OnlineIndexer implements AutoCloseable {
                     .setIfDisabled(ifDisabled)
                     .setIfWriteOnly(ifWriteOnly)
                     .setIfMismatchPrevious(ifMismatchPrevious)
-                    .setIfReadable(ifReadable);
+                    .setIfReadable(ifReadable)
+                    .allowUniquePendingState(allowUniquePendingState)
+                    .allowTakeoverContinue(allowUniquePendingState)
+                    .setMutualIndexing(mutualIndexingBoundaries)
+                    .setMutualIndexing(mutualIndexing)
+                    ;
         }
 
         /**
@@ -2140,6 +2190,14 @@ public class OnlineIndexer implements AutoCloseable {
         }
 
         /**
+         *  If true, allow - in some specific cases - to continue building an index that was partly built by another indexing method.
+         * @return true if allowed/
+         */
+        public boolean shouldAllowTakeoverContinue() {
+            return allowTakeoverContinue;
+        }
+
+        /**
          * Builder for {@link IndexingPolicy}.
          *
          * <pre><code>
@@ -2162,6 +2220,9 @@ public class OnlineIndexer implements AutoCloseable {
             private DesiredAction ifMismatchPrevious = DesiredAction.CONTINUE;
             private DesiredAction ifReadable = DesiredAction.CONTINUE;
             private boolean doAllowUniqueuPendingState = false;
+            private boolean doAllowTakeoverContinue = false;
+            private boolean useMutualIndexing = false;
+            private List<Tuple> useMutualIndexingBoundaries = null;
 
             protected Builder() {
             }
@@ -2293,10 +2354,79 @@ public class OnlineIndexer implements AutoCloseable {
                 return this;
             }
 
+            /**
+             * Call {@link #allowTakeoverContinue(boolean)} (boolean)} with default true.
+             * @return this builder
+             */
+            public Builder allowTakeoverContinue() {
+                return this.allowTakeoverContinue(true);
+            }
+
+            /**
+             * In some special cases, an indexing method is allowed to continue building an index that was partly
+             * built by another method. If the other indexing session is still running, a "takeover" may cause it to fail.
+             * Note that it goes one way - once there is a "takeover", there is no way to continue building with the previous method.
+             * The current supported takeovers are:
+             *  * "Single index by records" may continue a multi index session.
+             *  * "Single index by records" may continue a mutually built session.
+             * @param allow if true, allow takeover.
+             * @return this builder
+             */
+            public Builder allowTakeoverContinue(boolean allow) {
+                this.doAllowTakeoverContinue = allow;
+                return this;
+            }
+
+            /**
+             * Call {@link #setMutualIndexing(boolean)} with default true.
+             * @return this builder
+             */
+            public Builder setMutualIndexing() {
+                this.useMutualIndexing = true;
+                return this;
+            }
+
+            /**
+             * If set, allow mutual (parallel) indexing. In this state, the indexer will assume that other indexers, called
+             * by other threads/processes/systems with the exact same parameters, are attempting to concurrently build this
+             * index. To allow that, the indexer will:
+             *   1. Use an a-synchronized session (i.e. avoid the indexing lock)
+             *   2. Divide the records space to fragments, then iterate the fragments in a minimal interference way, while
+             *      indexing each fragment independently.
+             *   3. Handle indexing conflicts, when occurred.
+             * The caller may use any number of concurrent indexers according to his needs. By default, the fragments are
+             * split by primary key boundaries (this can be override by {@link #setMutualIndexing(List)}).
+             *
+             * @param useMutualIndexing if true, allow this state.
+             * @return this builder
+             */
+            public Builder setMutualIndexing(final boolean useMutualIndexing) {
+                this.useMutualIndexing = useMutualIndexing;
+                return this;
+            }
+
+            /**
+             * Same as {@link #setMutualIndexing()}, but will use a pre-defined set of keys to split
+             * the records space to fragments.
+             * @param primaryKeysBoundaries set of primary keys that will be used to split the records space to fragments. Null/empty list will set mutual indexing to false;
+             * @return this builder
+             */
+            public Builder setMutualIndexing(final List<Tuple> primaryKeysBoundaries) {
+                if (primaryKeysBoundaries == null || primaryKeysBoundaries.isEmpty()) {
+                    this.useMutualIndexing = false;
+                    this.useMutualIndexingBoundaries = null;
+                } else {
+                    this.useMutualIndexing = true;
+                    this.useMutualIndexingBoundaries = new ArrayList<>(primaryKeysBoundaries);
+                }
+                return this;
+            }
+
             public IndexingPolicy build() {
                 return new IndexingPolicy(sourceIndex, sourceIndexSubspaceKey, forbidRecordScan,
                         ifDisabled, ifWriteOnly, ifMismatchPrevious, ifReadable,
-                        doAllowUniqueuPendingState);
+                        doAllowUniqueuPendingState, doAllowTakeoverContinue,
+                        useMutualIndexing, useMutualIndexingBoundaries);
             }
         }
     }
