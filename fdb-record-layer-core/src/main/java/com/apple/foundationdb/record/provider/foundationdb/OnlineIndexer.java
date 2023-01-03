@@ -231,7 +231,7 @@ public class OnlineIndexer implements AutoCloseable {
                 // Make an effort to finish indexing. Attempt continuation of the previous method
                 // Here: match the policy to the previous run
                 IndexBuildProto.IndexBuildIndexingStamp.Method method = conflictingIndexingTypeStamp.getMethod();
-                if (method == IndexBuildProto.IndexBuildIndexingStamp.Method.BY_RECORDS) {
+                if (method == IndexBuildProto.IndexBuildIndexingStamp.Method.BY_RECORDS && !common.isMultiTarget()) {
                     // Partly built by records. The fallback indicator should handle the policy
                     fallbackToRecordsScan = true;
                     return indexingLauncher(indexingFunc, attemptCount);
@@ -242,7 +242,7 @@ public class OnlineIndexer implements AutoCloseable {
                     fallbackToRecordsScan = true;
                     return indexingLauncher(indexingFunc, attemptCount);
                 }
-                if (method == IndexBuildProto.IndexBuildIndexingStamp.Method.BY_INDEX) {
+                if (method == IndexBuildProto.IndexBuildIndexingStamp.Method.BY_INDEX && !common.isMultiTarget()) {
                     // Partly built by index. Retry with the old policy, but preserve the requested policy - in case the old one fails.
                     Object sourceIndexSubspaceKey = decodeSubspaceKey(conflictingIndexingTypeStamp.getSourceIndexSubspaceKey());
                     IndexingPolicy origPolicy = indexingPolicy;
