@@ -22,6 +22,8 @@ package com.apple.foundationdb.record.provider.foundationdb;
 
 import com.apple.foundationdb.record.RecordCoreException;
 import com.apple.foundationdb.record.TestRecords1Proto;
+import com.apple.foundationdb.record.logging.KeyValueLogMessage;
+import com.apple.foundationdb.record.logging.LogMessageKeys;
 import com.apple.foundationdb.record.metadata.Index;
 import com.apple.foundationdb.record.metadata.IndexOptions;
 import com.apple.foundationdb.record.metadata.IndexTypes;
@@ -33,6 +35,10 @@ import com.apple.foundationdb.tuple.Tuple;
 import com.apple.test.Tags;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -50,10 +56,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Tests for mutually building indexes {@link OnlineIndexer}.
  */
 public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
+    private static final Logger LOGGER = LoggerFactory.getLogger(OnlineIndexerMutualTest.class);
 
     private void populateData(final long numRecords) {
         List<TestRecords1Proto.MySimpleRecord> records = LongStream.range(0, numRecords).mapToObj(val ->
-                TestRecords1Proto.MySimpleRecord.newBuilder().setRecNo(val).build()
+                TestRecords1Proto.MySimpleRecord.newBuilder()
+                        .setRecNo(val)
+                        .setNumValue2((int)val * 19)
+                        .setNumValue3Indexed((int) val * 77)
+                        .setNumValueUnique((int)val * 1139)
+                        .build()
         ).collect(Collectors.toList());
 
         try (FDBRecordContext context = openContext())  {
@@ -73,8 +85,6 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
     }
 
     private List<Tuple> getBoundariesList(final long numRecords, final long step) {
-
-
         List<Tuple> boundaries = new ArrayList<>();
         boundaries.add(null);
         for (long i = step; i < numRecords; i += step) {
@@ -99,7 +109,7 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
 
     @Test
     void testMutualIndexingNoBoundaries() {
-        // Let a single thread build all the indexes - boundaries will be detected automatically - which means (null, null)
+        // Let a single thread build all the indexes - boundaries will be detected automatically - which means (null, null) because the data set will be too small to have multiple shards in fdb
         final FDBStoreTimer timer = new FDBStoreTimer();
 
         List<Index> indexes = new ArrayList<>();
@@ -128,50 +138,28 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
         assertEquals(numRecords, timer.getCount(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RECORDS_SCANNED));
         assertEquals(numRecords, timer.getCount(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RECORDS_INDEXED));
         assertAllReadable(indexes);
+        validateIndexes(indexes);
     }
 
-    @Test
-    void testMutualIndexingSingleThread1() {
-        testMutualIndexing(103, 10);
-    }
-
-    @Test
-    @Tag(Tags.Slow)
-    void testMutualIndexingSingleThread2() {
-        testMutualIndexing(417, 17);
-    }
-
-    @Test
-    @Tag(Tags.Slow)
-    void testMutualIndexingSingleThread3() {
-        testMutualIndexing(1417, 57);
-    }
-
-    @Test
-    void testMutualIndexingMultiThread1() {
-        testMutualIndexing(4, 103, 17);
-    }
-
-    @Test
-    @Tag(Tags.Slow)
-    void testMutualIndexingMultiThread2() {
-        testMutualIndexing(40, 773, 14);
-    }
-
-    @Test
-    @Tag(Tags.Slow)
-    void testMutualIndexingMultiThread3() {
-        testMutualIndexing(20, 299, 19);
-    }
-
-    private void testMutualIndexing(long numRecords, long boundarySize) {
-        testMutualIndexing(0, numRecords, boundarySize);
-    }
-
-    private void testMutualIndexing(int numThreads, long numRecords, long boundarySize) {
+    @ParameterizedTest
+    @CsvSource({
+            // single threads:
+            "0, 103, 10",
+            "0, 417, 17",
+            "0, 1417, 157",
+            "0, 40, 2", // small fragments
+            "0, 30, 1", // smaller fragments
+            // multi threads:
+            "4, 103, 17",
+            "40, 773, 14",
+            "20, 299, 19",
+            "3, 40, 2", // small fragments
+            "3, 30, 1", // smaller fragments
+    })
+    void testMutualIndexing(int numThreads, long numRecords, long boundarySize) {
         // build indexing by boundaries.
         // If numThreads < 2 - do it in a single thread.
-        // Else, perform it in parallele by multiple threads
+        // Else, perform it in parallel by multiple threads
         List<Index> indexes = new ArrayList<>();
         // Here: Value indexes only
         indexes.add(new Index("indexA", field("num_value_2"), EmptyKeyExpression.EMPTY, IndexTypes.VALUE, IndexOptions.UNIQUE_OPTIONS));
@@ -192,7 +180,7 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
             oneThreadIndexing(indexes, timer, boundariesList);
         } else {
             IntStream range = IntStream.rangeClosed(0, numThreads);
-            range.parallel().forEach(ignore -> oneThreadIndexing(indexes, timer, boundariesList));
+            range.parallel().forEach(ignore -> oneThreadIndexing(indexes, null, boundariesList));
         }
 
         if (numThreads < 2) {
@@ -203,20 +191,26 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
         validateIndexes(indexes);
     }
 
-    void oneThreadIndexing(List<Index> indexes, FDBStoreTimer timer, List<Tuple> boundaries) {
+    void oneThreadIndexing(List<Index> indexes, FDBStoreTimer callerTimer, List<Tuple> boundaries) {
         FDBRecordStoreTestBase.RecordMetaDataHook hook = allIndexesHook(indexes);
         openSimpleMetaData(hook);
-
+        final FDBStoreTimer timer = callerTimer != null ? callerTimer : new FDBStoreTimer();
         try (OnlineIndexer indexBuilder = OnlineIndexer.newBuilder()
                 .setDatabase(fdb).setMetaData(metaData).setSubspace(subspace)
                 .setTargetIndexes(indexes)
                 .setTimer(timer)
                 .setIndexingPolicy(OnlineIndexer.IndexingPolicy.newBuilder()
-                        .setMutualIndexing(boundaries)
+                        .setMutualIndexingBoundaries(boundaries)
                         .build())
                 .build()) {
-
             indexBuilder.buildIndex(true);
+        }
+        if (callerTimer == null && LOGGER.isInfoEnabled()) {
+            int numScanned = timer.getCount(FDBStoreTimer.Counts.ONLINE_INDEX_BUILDER_RECORDS_SCANNED);
+            LOGGER.info(KeyValueLogMessage.of("oneThreadIndexing",
+                    LogMessageKeys.RECORDS_SCANNED, numScanned,
+                    "tid", Thread.currentThread().getId()
+            ));
         }
     }
 
@@ -231,7 +225,7 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
                 .setTargetIndexes(indexes)
                 .setTimer(timer)
                 .setIndexingPolicy(OnlineIndexer.IndexingPolicy.newBuilder()
-                        .setMutualIndexing(boundaries)
+                        .setMutualIndexingBoundaries(boundaries)
                         .build())
                 .setConfigLoader(old -> {
                     if (counter.incrementAndGet() > 1) {
@@ -256,6 +250,7 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
         indexes.add(new Index("indexA", field("num_value_2"), EmptyKeyExpression.EMPTY, IndexTypes.VALUE, IndexOptions.UNIQUE_OPTIONS));
         indexes.add(new Index("indexC", field("num_value_unique"), EmptyKeyExpression.EMPTY, IndexTypes.VALUE, IndexOptions.UNIQUE_OPTIONS));
         indexes.add(new Index("indexD", new GroupingKeyExpression(EmptyKeyExpression.EMPTY, 0), IndexTypes.COUNT));
+        Index unusedIndex = new Index("indexB", field("num_value_3_indexed"), IndexTypes.VALUE);
 
         int numRecords = 543;
         openSimpleMetaData();
@@ -341,7 +336,7 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
         int boundarySize = 10;
         final List<Tuple> boundariesList = getBoundariesList(numRecords, boundarySize);
 
-        // First crash, 8 threads, crash after 1:
+        // First crash, 10 threads, crash after 1:
         IntStream.rangeClosed(0, 10).parallel().forEach(ignore ->
                 oneThreadIndexingCrashHalfway(indexes, timer, boundariesList, 1));
 
@@ -369,8 +364,7 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
     @Test
     void testMutualIndexingCrashAndAllowContinueNonMutually() {
         // Start building with multi threads, crash all
-        // Make sure that the regular indexing is blocked
-        // Finish indexing, just for fun.
+        // Make sure that the regular indexing is unblocked
         List<Index> indexes = new ArrayList<>();
         indexes.add(new Index("indexC", field("num_value_unique"), EmptyKeyExpression.EMPTY, IndexTypes.VALUE, IndexOptions.UNIQUE_OPTIONS));
         indexes.add(new Index("indexD", new GroupingKeyExpression(EmptyKeyExpression.EMPTY, 0), IndexTypes.COUNT));
@@ -386,7 +380,7 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
         int boundarySize = 11;
         final List<Tuple> boundariesList = getBoundariesList(numRecords, boundarySize);
 
-        // First crash, 8 threads, crash after 1:
+        // First crash, 5 threads, crash after 1:
         IntStream.rangeClosed(0, 5).parallel().forEach(ignore ->
                 oneThreadIndexingCrashHalfway(indexes, timer, boundariesList, 1));
 
@@ -412,9 +406,7 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
 
     @Test
     void testMutualIndexingWeirdBoundaries() {
-        // Start building with multi threads, crash all
-        // Continue with other threads, crash them too
-        // Successfully finish indexing with other threads
+        // test some boundaries end cases
         List<Index> indexes = new ArrayList<>();
         indexes.add(new Index("indexC", field("num_value_unique"), EmptyKeyExpression.EMPTY, IndexTypes.VALUE, IndexOptions.UNIQUE_OPTIONS));
         indexes.add(new Index("indexD", new GroupingKeyExpression(EmptyKeyExpression.EMPTY, 0), IndexTypes.COUNT));
@@ -429,7 +421,78 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
         final FDBStoreTimer timer = new FDBStoreTimer();
         int boundarySize = 10;
         final List<Tuple> boundariesList = getBoundariesList(numRecords, boundarySize);
-        assertEquals(boundariesList.size(), 11);
+        assertEquals(11, boundariesList.size());
+
+        // Add null in the middle, causing fragments to overlap
+        boundariesList.add(0, null);
+        // Build and validate
+        IntStream.rangeClosed(0, 8).parallel().forEach(ignore ->
+                oneThreadIndexing(indexes, timer, boundariesList));
+        assertAllReadable(indexes);
+        validateIndexes(indexes);
+
+        disableAll(indexes);
+        // Duplicate entry, causing empty fragments
+        boundariesList.add(7, boundariesList.get(7));
+        boundariesList.add(10, boundariesList.get(10));
+        boundariesList.add(10, boundariesList.get(10));
+
+        // Build and validate
+        IntStream.rangeClosed(0, 3).parallel().forEach(ignore ->
+                oneThreadIndexing(indexes, timer, boundariesList));
+        assertAllReadable(indexes);
+        validateIndexes(indexes);
+
+        // pad with nulls, causing more empty fragments
+        boundariesList.add(0, null);
+        boundariesList.add(boundariesList.size() - 1, null);
+
+        // Build and validate
+        IntStream.rangeClosed(0, 18).parallel().forEach(ignore ->
+                oneThreadIndexing(indexes, timer, boundariesList));
+        assertAllReadable(indexes);
+        validateIndexes(indexes);
+    }
+
+    @Test
+    void testMutualIndexingWithEmptyFragments() {
+        // repeat testing boundaries end cases, but when most boundaries (well, fragments) contain no actual records
+        List<Index> indexes = new ArrayList<>();
+        indexes.add(new Index("indexC", field("num_value_unique"), EmptyKeyExpression.EMPTY, IndexTypes.VALUE, IndexOptions.UNIQUE_OPTIONS));
+        indexes.add(new Index("indexD", new GroupingKeyExpression(EmptyKeyExpression.EMPTY, 0), IndexTypes.COUNT));
+
+        openSimpleMetaData();
+        List<TestRecords1Proto.MySimpleRecord> headRecords = LongStream.range(0, 100).mapToObj(val ->
+                TestRecords1Proto.MySimpleRecord.newBuilder()
+                        .setRecNo(val)
+                        .setNumValue2((int)val * 19)
+                        .setNumValue3Indexed((int) val * 77)
+                        .setNumValueUnique((int)val * 1139)
+                        .build()
+        ).collect(Collectors.toList());
+        List<TestRecords1Proto.MySimpleRecord> tailRecords = LongStream.range(938, 1000).mapToObj(val ->
+                TestRecords1Proto.MySimpleRecord.newBuilder()
+                        .setRecNo(val)
+                        .setNumValue2((int)val * 19)
+                        .setNumValue3Indexed((int) val * 77)
+                        .setNumValueUnique((int)val * 1139)
+                        .build()
+        ).collect(Collectors.toList());
+
+        try (FDBRecordContext context = openContext())  {
+            headRecords.forEach(recordStore::saveRecord);
+            tailRecords.forEach(recordStore::saveRecord);
+            context.commit();
+        }
+
+        FDBRecordStoreTestBase.RecordMetaDataHook hook = allIndexesHook(indexes);
+        openSimpleMetaData(hook);
+        disableAll(indexes);
+        final FDBStoreTimer timer = new FDBStoreTimer();
+        int boundarySize = 10;
+        int pseudoNumRecords = 1000;
+        final List<Tuple> boundariesList = getBoundariesList(pseudoNumRecords, boundarySize);
+        assertEquals(101, boundariesList.size());
 
         // Add null in the middle, causing fragments to overlap
         boundariesList.add(0, null);

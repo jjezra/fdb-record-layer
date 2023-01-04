@@ -213,7 +213,7 @@ public class OnlineIndexer implements AutoCloseable {
         // the modified parameters.
         indexer = null;
 
-        final IndexingBase.PartlyBuiltException partlyBuiltException = IndexingBase.getAPartlyBuildExceptionIfApplicable(ex);
+        final IndexingBase.PartlyBuiltException partlyBuiltException = IndexingBase.getAPartlyBuiltExceptionIfApplicable(ex);
         if (partlyBuiltException != null) {
             // An ongoing indexing process with a different method type was found. Some precondition cases should be handled.
             IndexBuildProto.IndexBuildIndexingStamp conflictingIndexingTypeStamp = partlyBuiltException.savedStamp;
@@ -2035,20 +2035,21 @@ public class OnlineIndexer implements AutoCloseable {
         }
 
         /**
-         * Build the index from a source index. Source index must be readable, idempotent, and fully cover the target index.
-         * @param sourceIndex source index
+         * Create a policy for the indexing session.
+         * @param sourceIndex Build the index from a source index. Source index must be readable, idempotent, and fully cover the target index
          * @param sourceIndexSubspaceKey if non-null, overrides the sourceIndex param
          * @param forbidRecordScan forbid fallback to a by-records scan
          * @param ifDisabled desired action if the existing index state is DISABLED
          * @param ifWriteOnly desired action if the existing index state is WRITE_ONLY (i.e. partly built)
          * @param ifMismatchPrevious desired action if the index is partly built, but by a different method then currently requested
          * @param ifReadable desired action if the existing index state is READABLE (i.e. already built)
-         * @param allowUniquePendingState if false, forbid {@link IndexState#READABLE_UNIQUE_PENDING} state.
+         * @param allowUniquePendingState if false, forbid {@link IndexState#READABLE_UNIQUE_PENDING} state
+         * @param allowTakeoverContinue if true and possible, allow indexing continuation of a different indexing method
          * @param mutualIndexing if true, use mutual indexing (i.e., index in a way that allows other processes to cooperatively build the index)
-         * @param mutualIndexingBoundaries if present, use this predefined list of ranges. Else, split ranges by shards.
+         * @param mutualIndexingBoundaries if present, use this predefined list of ranges. Else, split ranges by shards
          */
         @SuppressWarnings("squid:S00107") // too many parameters
-        public IndexingPolicy(@Nullable String sourceIndex, @Nullable Object sourceIndexSubspaceKey, boolean forbidRecordScan,
+        private IndexingPolicy(@Nullable String sourceIndex, @Nullable Object sourceIndexSubspaceKey, boolean forbidRecordScan,
                               DesiredAction ifDisabled, DesiredAction ifWriteOnly, DesiredAction ifMismatchPrevious, DesiredAction ifReadable,
                               boolean allowUniquePendingState, boolean allowTakeoverContinue,
                               boolean mutualIndexing, List<Tuple> mutualIndexingBoundaries) {
@@ -2128,7 +2129,7 @@ public class OnlineIndexer implements AutoCloseable {
                     .setIfReadable(ifReadable)
                     .allowUniquePendingState(allowUniquePendingState)
                     .allowTakeoverContinue(allowUniquePendingState)
-                    .setMutualIndexing(mutualIndexingBoundaries)
+                    .setMutualIndexingBoundaries(mutualIndexingBoundaries)
                     .setMutualIndexing(mutualIndexing)
                     ;
         }
@@ -2190,8 +2191,9 @@ public class OnlineIndexer implements AutoCloseable {
         }
 
         /**
-         *  If true, allow - in some specific cases - to continue building an index that was partly built by another indexing method.
-         * @return true if allowed/
+         *  If true, allow - in some specific cases - to continue building an index that was partly built by a different indexing method.
+         *  (See @link #allowTakeoverContinue(boolean))
+         * @return true if allowed
          */
         public boolean shouldAllowTakeoverContinue() {
             return allowTakeoverContinue;
@@ -2381,6 +2383,7 @@ public class OnlineIndexer implements AutoCloseable {
              * Call {@link #setMutualIndexing(boolean)} with default true.
              * @return this builder
              */
+            @API(API.Status.EXPERIMENTAL)
             public Builder setMutualIndexing() {
                 this.useMutualIndexing = true;
                 return this;
@@ -2394,35 +2397,42 @@ public class OnlineIndexer implements AutoCloseable {
              *   2. Divide the records space to fragments, then iterate the fragments in a minimal interference way, while
              *      indexing each fragment independently.
              *   3. Handle indexing conflicts, when occurred.
-             * The caller may use any number of concurrent indexers according to his needs. By default, the fragments are
-             * split by primary key boundaries (this can be override by {@link #setMutualIndexing(List)}).
+             * The caller may use any number of concurrent indexers as desired. By default, the fragments are
+             * split by primary key boundaries (the boundaries can also be preset by {@link #setMutualIndexingBoundaries(List)}).
              *
              * @param useMutualIndexing if true, allow this state.
              * @return this builder
              */
+            @API(API.Status.EXPERIMENTAL)
             public Builder setMutualIndexing(final boolean useMutualIndexing) {
                 this.useMutualIndexing = useMutualIndexing;
+                if (!useMutualIndexing) {
+                    useMutualIndexingBoundaries = null;
+                }
                 return this;
             }
 
             /**
              * Same as {@link #setMutualIndexing()}, but will use a pre-defined set of keys to split
-             * the records space to fragments.
-             * @param primaryKeysBoundaries set of primary keys that will be used to split the records space to fragments. Null/empty list will set mutual indexing to false;
+             * the records space to fragments. {@code null} can be used to clear this value.
+             * To ensure defining the full records range, the boundaries list can begin and end with a `null`.
+             * @param primaryKeysBoundaries set of primary keys that will be used to split the records space to fragments.
              * @return this builder
              */
-            public Builder setMutualIndexing(final List<Tuple> primaryKeysBoundaries) {
+            @API(API.Status.EXPERIMENTAL)
+            public Builder setMutualIndexingBoundaries(final List<Tuple> primaryKeysBoundaries) {
                 if (primaryKeysBoundaries == null || primaryKeysBoundaries.isEmpty()) {
-                    this.useMutualIndexing = false;
                     this.useMutualIndexingBoundaries = null;
                 } else {
-                    this.useMutualIndexing = true;
                     this.useMutualIndexingBoundaries = new ArrayList<>(primaryKeysBoundaries);
                 }
                 return this;
             }
 
             public IndexingPolicy build() {
+                if (useMutualIndexingBoundaries != null) {
+                    useMutualIndexing = true;
+                }
                 return new IndexingPolicy(sourceIndex, sourceIndexSubspaceKey, forbidRecordScan,
                         ifDisabled, ifWriteOnly, ifMismatchPrevious, ifReadable,
                         doAllowUniqueuPendingState, doAllowTakeoverContinue,

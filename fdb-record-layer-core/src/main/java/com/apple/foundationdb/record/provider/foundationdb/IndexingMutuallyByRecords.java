@@ -90,18 +90,19 @@ public class IndexingMutuallyByRecords extends IndexingBase {
     @Nonnull
     private static final Logger LOGGER = LoggerFactory.getLogger(IndexingMutuallyByRecords.class);
 
-    List<Tuple> fragmentBoundaries;
-    int fragmentNum;
-    int fragmentStep;
-    int fragmentFirst;
-    int fragmentCurrent;
-    FragmentIterationType fragmentIterationType;
-    Tuple fragmentLastRange;
-    int loopProtectionCounter;
-    String loopProtectionToken = "";
+    private List<Tuple> fragmentBoundaries;
+    private int fragmentNum;
+    private int fragmentStep;
+    private int fragmentFirst;
+    private int fragmentCurrent;
+    private FragmentIterationType fragmentIterationType;
+    private int loopProtectionCounter;
+    private String loopProtectionToken = "";
 
     enum FragmentIterationType {
-        FULL, ANY, RECOVER
+        FULL,     // 1st iteration: only build fragments that are fully unbuilt (for efficiency).
+        ANY,      // 2nd iteration: build any fragment that has a missing range.
+        RECOVER   // 3rd iteration: presently throws an error, letting the caller handle recovery..
     }
 
     public IndexingMutuallyByRecords(@Nonnull final IndexingCommon common, @Nonnull final OnlineIndexer.IndexingPolicy policy,
@@ -121,7 +122,6 @@ public class IndexingMutuallyByRecords extends IndexingBase {
 
     @Nonnull
     private static IndexBuildProto.IndexBuildIndexingStamp compileIndexingTypeStamp(List<String> targetIndexes) {
-
         if (targetIndexes.isEmpty()) {
             throw new ValidationException("No target index was set");
         }
@@ -218,7 +218,6 @@ public class IndexingMutuallyByRecords extends IndexingBase {
         fragmentFirst = rn.nextInt(fragmentNum);
         fragmentCurrent = fragmentFirst;
         fragmentIterationType = FragmentIterationType.FULL;
-        fragmentLastRange = null;
         if (LOGGER.isInfoEnabled()) {
             LOGGER.info(KeyValueLogMessage.build("fragmentation init values")
                             .addKeysAndValues(fragmentLogMessageKeyValues()).toString());
@@ -278,7 +277,9 @@ public class IndexingMutuallyByRecords extends IndexingBase {
                             return subspaceProvider.getSubspaceAsync(context)
                                     .thenCompose(subspace -> buildMultiTargetIndex(subspaceProvider, subspace));
                         })
-                ), common.indexLogMessageKeyValues("IndexingMutuallyByRecords::buildIndexInternalAsync"));
+                ),
+                common.indexLogMessageKeyValues("IndexingMutuallyByRecords::buildIndexInternalAsync",
+                        fragmentLogMessageKeyValues()));
     }
 
     @Nonnull
@@ -503,8 +504,7 @@ public class IndexingMutuallyByRecords extends IndexingBase {
             if (0 < loopProtectionCounter) {
                 throw new ValidationException("Potential infinite loop",
                         LogMessageKeys.RANGE, token,
-                        LogMessageKeys.MISSING_RANGES, missingRanges,
-                        fragmentLogMessageKeyValues());
+                        LogMessageKeys.MISSING_RANGES, missingRanges);
             }
         } else {
             loopProtectionCounter = 1000;

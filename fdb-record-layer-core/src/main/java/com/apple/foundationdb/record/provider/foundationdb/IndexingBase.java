@@ -56,7 +56,9 @@ import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -925,7 +927,7 @@ public abstract class IndexingBase {
         }
     }
 
-    public static PartlyBuiltException getAPartlyBuildExceptionIfApplicable(@Nullable Throwable ex) {
+    public static PartlyBuiltException getAPartlyBuiltExceptionIfApplicable(@Nullable Throwable ex) {
         return (PartlyBuiltException) findException(ex, PartlyBuiltException.class);
     }
 
@@ -947,13 +949,14 @@ public abstract class IndexingBase {
     }
 
     private static <T> Throwable findException(@Nullable Throwable ex, Class<T> classT) {
-        int allowedDepth = 20;
+        Set<Throwable> seenSet = new HashSet<>();
         for (Throwable current = ex;
-                current != null && allowedDepth > 0;
-                current = current.getCause(), allowedDepth --) {
+                current != null && !seenSet.contains(current);
+                current = current.getCause()) {
             if (classT.isInstance(current)) {
                 return current;
             }
+            seenSet.add(current);
         }
         return null;
     }

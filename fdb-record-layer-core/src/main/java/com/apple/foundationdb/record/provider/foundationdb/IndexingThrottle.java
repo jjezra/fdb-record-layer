@@ -196,11 +196,18 @@ public class IndexingThrottle {
 
         AtomicInteger tries = new AtomicInteger(0);
         CompletableFuture<R> ret = new CompletableFuture<>();
+        final ExponentialDelay delay = new ExponentialDelay(common.getRunner().getDatabase().getFactory().getInitialDelayMillis(),
+                common.getRunner().getDatabase().getFactory().getMaxDelayMillis());
         AsyncUtil.whileTrue(() -> {
             loadConfig();
             return common.getRunner().runAsync(context -> common.getRecordStoreBuilder().copyBuilder().setContext(context).openAsync().thenCompose(store -> {
                 List<IndexState> indexStates = common.getTargetIndexes().stream().map(store::getIndexState).collect(Collectors.toList());
                 if (indexStates.stream().anyMatch(state -> state != expectedIndexState)) {
+                    // possible exceptions:
+                    // 1. All the indexes are now readable.
+                    // 2. Some indexes are built, but all the others are in the expected state.
+                    // 3. Some indexes are not in the expected state (disabled?).
+                    // During mutual indexing, the first two may be part of the valid path
                     if (indexStates.stream().allMatch(state -> state == IndexState.READABLE)) {
                         throw new IndexingBase.UnexpectedReadableException(true, "All indexes are built");
                     }
@@ -225,8 +232,6 @@ public class IndexingThrottle {
                         if (handleLessenWork != null) {
                             handleLessenWork.accept(fdbE, onlineIndexerLogMessageKeyValues);
                         }
-                        final ExponentialDelay delay = new ExponentialDelay(common.getRunner().getDatabase().getFactory().getInitialDelayMillis(),
-                                common.getRunner().getDatabase().getFactory().getMaxDelayMillis());
                         if (LOGGER.isWarnEnabled()) {
                             final KeyValueLogMessage message = KeyValueLogMessage.build("Retrying Runner Exception",
                                     LogMessageKeys.INDEXER_CURR_RETRY, currTries,
