@@ -20,6 +20,7 @@
 
 package com.apple.foundationdb.record.provider.foundationdb;
 
+import com.apple.foundationdb.Range;
 import com.apple.foundationdb.record.RecordCoreException;
 import com.apple.foundationdb.record.TestRecords1Proto;
 import com.apple.foundationdb.record.logging.KeyValueLogMessage;
@@ -41,6 +42,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
@@ -49,6 +51,8 @@ import java.util.stream.LongStream;
 
 import static com.apple.foundationdb.record.metadata.Key.Expressions.field;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -228,7 +232,7 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
                         .setMutualIndexingBoundaries(boundaries)
                         .build())
                 .setConfigLoader(old -> {
-                    if (counter.incrementAndGet() > 1) {
+                    if (counter.incrementAndGet() > after) {
                         throw new RecordCoreException(testThrowMsg);
                     }
                     return old;
@@ -523,5 +527,106 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
                 oneThreadIndexing(indexes, timer, boundariesList));
         assertAllReadable(indexes);
         validateIndexes(indexes);
+    }
+
+    @Test
+    void testSortAndSquash() {
+        List<byte[]> points = new ArrayList<>();
+        points.add(byteEmpty());
+        for (int i = 2; i < 0xff; i += 3) {
+            points.add(byteOf(i));
+        }
+        points.add(byteOf(0xff));
+        List<Range> ranges = new ArrayList<>();
+        for (int i = 0; i < points.size() - 1; i++) {
+            ranges.add(new Range(points.get(i), points.get(i + 1)));
+        }
+        List<Range> partial = new ArrayList<>();
+        for (int i = 1 ; i < ranges.size(); i += 4) {
+            partial.add(ranges.get(i));
+        }
+        // test squash
+        Collections.shuffle(ranges);
+        List<Range> squashed = IndexingMutuallyByRecords.sortAndSquash(ranges);
+        assertEquals(1, squashed.size());
+        assertEquals(points.get(0), squashed.get(0).begin);
+        assertEquals(points.get(points.size() - 1), squashed.get(0).end);
+
+        // test sort without squash
+        List<Range> partialShuffled = new ArrayList<>(partial);
+        Collections.shuffle(partialShuffled);
+        squashed = IndexingMutuallyByRecords.sortAndSquash(partialShuffled);
+        assertEquals(partial, squashed);
+    }
+
+    @Test
+    void testFullyUnBuiltRange() {
+        List<Range> ranges = new ArrayList<>();
+        ranges.add(rangeOf(0, 9));
+        ranges.add(rangeOf(20, 29));
+        ranges.add(rangeOf(40, 49));
+        // fully unbuilt
+        checkFully(ranges, 0, 9);
+        checkFully(ranges, 0, 8);
+        checkFully(ranges, 41, 49);
+        checkFully(ranges, 23, 24);
+        // not fully unbuilt
+        assertNull(IndexingMutuallyByRecords.fullyUnBuiltRange(ranges, rangeOf(0, 10)));
+        assertNull(IndexingMutuallyByRecords.fullyUnBuiltRange(ranges, rangeOf(8, 10)));
+        assertNull(IndexingMutuallyByRecords.fullyUnBuiltRange(ranges, rangeOf(9, 10)));
+        assertNull(IndexingMutuallyByRecords.fullyUnBuiltRange(ranges, rangeOf(100, 110)));
+        assertNull(IndexingMutuallyByRecords.fullyUnBuiltRange(ranges, rangeOf(0, 20)));
+        assertNull(IndexingMutuallyByRecords.fullyUnBuiltRange(ranges, rangeOf(20, 300)));
+        assertNull(IndexingMutuallyByRecords.fullyUnBuiltRange(ranges, rangeOf(41, 50)));
+        assertNull(IndexingMutuallyByRecords.fullyUnBuiltRange(ranges, rangeOf(20, 44)));
+    }
+
+    @Test
+    void testPartlyUnBuiltRange() {
+        List<Range> ranges = new ArrayList<>();
+        ranges.add(rangeOf(0, 9));
+        ranges.add(rangeOf(20, 29));
+        ranges.add(rangeOf(40, 49));
+        // fully unbuilt
+        checkPartial(ranges, 0, 9, 0, 9);
+        checkPartial(ranges, 0, 8, 0, 8);
+        checkPartial(ranges, 41, 49, 41, 49);
+        checkPartial(ranges, 23, 24, 23, 24);
+        // partly unbuilt
+        checkPartial(ranges, 14, 24, 20, 24);
+        checkPartial(ranges, 0, 12, 0, 9);
+        checkPartial(ranges, 0, 100, 0, 9);
+        checkPartial(ranges, 40, 100, 40, 49);
+        // no overlap
+        assertNull(IndexingMutuallyByRecords.partlyUnBuiltRange(ranges, rangeOf(10, 11)));
+        assertNull(IndexingMutuallyByRecords.partlyUnBuiltRange(ranges, rangeOf(100, 200)));
+        assertNull(IndexingMutuallyByRecords.partlyUnBuiltRange(ranges, rangeOf(33, 40)));
+    }
+
+    private static void checkFully(List<Range> ranges, int rangeStart, int rangeEnd) {
+        Range res = IndexingMutuallyByRecords.fullyUnBuiltRange(ranges, rangeOf(rangeStart, rangeEnd));
+        assertNotNull(res);
+        assertEquals(res.begin[0], byteOf(rangeStart)[0]);
+        assertEquals(res.end[0], byteOf(rangeEnd)[0]);
+    }
+
+    private static void checkPartial(List<Range> ranges, int rangeStart, int rangeEnd, int expectStart, int expectEnd) {
+        Range res = IndexingMutuallyByRecords.partlyUnBuiltRange(ranges, rangeOf(rangeStart, rangeEnd));
+        assertNotNull(res);
+        assertEquals(res.begin[0], byteOf(expectStart)[0]);
+        assertEquals(res.end[0], byteOf(expectEnd)[0]);
+    }
+
+    private static Range rangeOf(int start, int end) {
+        assertTrue(start < end);
+        return new Range(byteOf(start), byteOf(end));
+    }
+
+    private static byte[] byteOf(int i) {
+        return new byte[]{(byte) i};
+    }
+
+    private static byte[] byteEmpty() {
+        return new byte[0];
     }
 }

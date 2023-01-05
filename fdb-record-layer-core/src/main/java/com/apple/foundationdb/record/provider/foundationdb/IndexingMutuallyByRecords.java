@@ -38,6 +38,7 @@ import com.apple.foundationdb.record.metadata.Index;
 import com.apple.foundationdb.subspace.Subspace;
 import com.apple.foundationdb.tuple.ByteArrayUtil;
 import com.apple.foundationdb.tuple.Tuple;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.math.IntMath;
 import com.google.protobuf.Message;
 import org.slf4j.Logger;
@@ -425,8 +426,9 @@ public class IndexingMutuallyByRecords extends IndexingBase {
         });
     }
 
+    @VisibleForTesting
     @Nullable
-    private static Range fullyUnBuiltRange(List<Range> missingRanges, Range fragmentRange) {
+    static Range fullyUnBuiltRange(List<Range> missingRanges, Range fragmentRange) {
         // Return the fragmentRange 'as is' if it appears to be fully un-built in the
         // missing ranges list. Else return null.
         // * Assuming that the missing ranges are sorted and squashed
@@ -443,8 +445,9 @@ public class IndexingMutuallyByRecords extends IndexingBase {
         return null;
     }
 
+    @VisibleForTesting
     @Nullable
-    private static Range partlyUnBuiltRange(List<Range> missingRanges, Range fragmentRange) {
+    static Range partlyUnBuiltRange(List<Range> missingRanges, Range fragmentRange) {
         // Return null if the range appears to be fully built in the missing ranges list. Else
         // return the un-built range of (fragmentRange ∩ missingRanges)
         // * Assuming that the missing ranges are sorted and squashed
@@ -476,7 +479,8 @@ public class IndexingMutuallyByRecords extends IndexingBase {
                null : range;
     }
 
-    List<Range> sortAndSquash(List<Range> ranges) {
+    @VisibleForTesting
+    static List<Range> sortAndSquash(List<Range> ranges) {
         ranges.sort((a, b) -> ByteArrayUtil.compareUnsigned(a.begin, b.begin));
         boolean squasshed = false;
         for (int i = 0; i < ranges.size() - 1; i++) {
