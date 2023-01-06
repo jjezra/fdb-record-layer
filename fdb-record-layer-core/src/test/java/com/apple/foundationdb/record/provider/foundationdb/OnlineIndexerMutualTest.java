@@ -483,6 +483,7 @@ class OnlineIndexerMutualTest extends OnlineIndexerTest  {
     }
 
     @Test
+    @Tag(Tags.Slow)
     void testMutualIndexingWithEmptyFragments() {
         // repeat testing boundaries end cases, but when most boundaries (well, fragments) contain no actual records
         List<Index> indexes = new ArrayList<>();
