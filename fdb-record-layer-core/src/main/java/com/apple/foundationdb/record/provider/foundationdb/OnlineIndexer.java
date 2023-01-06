@@ -2191,8 +2191,8 @@ public class OnlineIndexer implements AutoCloseable {
         }
 
         /**
-         *  If true, allow - in some specific cases - to continue building an index that was partly built by a different indexing method.
-         *  (See @link #allowTakeoverContinue(boolean))
+         * If true, allow - in some specific cases - to continue building an index that was partly built by a different indexing method.
+         * (See {@link Builder#allowTakeoverContinue(boolean)}).
          * @return true if allowed
          */
         public boolean shouldAllowTakeoverContinue() {

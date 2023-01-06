@@ -486,7 +486,10 @@ public class IndexingMutuallyByRecords extends IndexingBase {
         for (int i = 0; i < ranges.size() - 1; i++) {
             if (ByteArrayUtil.compareUnsigned(ranges.get(i).end, ranges.get(i + 1).begin) >= 0) {
                 squasshed = true;
-                ranges.set(i + 1, new Range(ranges.get(i).begin, ranges.get(i + 1).end));
+                ranges.set(i + 1, new Range(ranges.get(i).begin,
+                        ByteArrayUtil.compareUnsigned(ranges.get(i).end, ranges.get(i + 1).end) >= 0 ?
+                        ranges.get(i).end :
+                        ranges.get(i + 1).end));
                 ranges.set(i, null);
             }
         }

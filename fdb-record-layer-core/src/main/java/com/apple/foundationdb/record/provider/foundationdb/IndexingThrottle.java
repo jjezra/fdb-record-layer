@@ -208,10 +208,10 @@ public class IndexingThrottle {
                     // 2. Some indexes are built, but all the others are in the expected state.
                     // 3. Some indexes are not in the expected state (disabled?).
                     // During mutual indexing, the first two may be part of the valid path
-                    if (indexStates.stream().allMatch(state -> state == IndexState.READABLE)) {
+                    if (indexStates.stream().allMatch(state -> (state == IndexState.READABLE || state == IndexState.READABLE_UNIQUE_PENDING))) {
                         throw new IndexingBase.UnexpectedReadableException(true, "All indexes are built");
                     }
-                    if (indexStates.stream().allMatch(state -> state == expectedIndexState || state == IndexState.READABLE)) {
+                    if (indexStates.stream().allMatch(state -> state == expectedIndexState || state == IndexState.READABLE || state == IndexState.READABLE_UNIQUE_PENDING)) {
                         throw new IndexingBase.UnexpectedReadableException(false, "Some indexes are built");
                     }
                     throw new RecordCoreStorageException("Unexpected index state(s)",

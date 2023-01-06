@@ -56,7 +56,7 @@ import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -949,7 +949,7 @@ public abstract class IndexingBase {
     }
 
     private static <T> Throwable findException(@Nullable Throwable ex, Class<T> classT) {
-        Set<Throwable> seenSet = new HashSet<>();
+        Set<Throwable> seenSet = Collections.newSetFromMap(new IdentityHashMap<>());
         for (Throwable current = ex;
                 current != null && !seenSet.contains(current);
                 current = current.getCause()) {

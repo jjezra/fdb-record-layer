@@ -21,8 +21,13 @@
 package com.apple.foundationdb.record.provider.foundationdb;
 
 import com.apple.foundationdb.Range;
+import com.apple.foundationdb.record.IndexEntry;
+import com.apple.foundationdb.record.IndexScanType;
 import com.apple.foundationdb.record.RecordCoreException;
+import com.apple.foundationdb.record.RecordIndexUniquenessViolation;
+import com.apple.foundationdb.record.ScanProperties;
 import com.apple.foundationdb.record.TestRecords1Proto;
+import com.apple.foundationdb.record.TupleRange;
 import com.apple.foundationdb.record.logging.KeyValueLogMessage;
 import com.apple.foundationdb.record.logging.LogMessageKeys;
 import com.apple.foundationdb.record.metadata.Index;
@@ -42,8 +47,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -59,7 +67,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Tests for mutually building indexes {@link OnlineIndexer}.
  */
-public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
+class OnlineIndexerMutualTest extends OnlineIndexerTest  {
     private static final Logger LOGGER = LoggerFactory.getLogger(OnlineIndexerMutualTest.class);
 
     private void populateData(final long numRecords) {
@@ -69,6 +77,21 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
                         .setNumValue2((int)val * 19)
                         .setNumValue3Indexed((int) val * 77)
                         .setNumValueUnique((int)val * 1139)
+                        .build()
+        ).collect(Collectors.toList());
+
+        try (FDBRecordContext context = openContext())  {
+            records.forEach(recordStore::saveRecord);
+            context.commit();
+        }
+    }
+
+    private void populateOtherData(final long numRecords, final long start) {
+        List<TestRecords1Proto.MyOtherRecord> records = LongStream.range(0, numRecords).mapToObj(val ->
+                TestRecords1Proto.MyOtherRecord.newBuilder()
+                        .setRecNo(val + start)
+                        .setNumValue2((int) val * 1033)
+                        .setNumValue3Indexed((int)val * 11111)
                         .build()
         ).collect(Collectors.toList());
 
@@ -448,6 +471,7 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
         validateIndexes(indexes);
 
         // pad with nulls, causing more empty fragments
+        disableAll(indexes);
         boundariesList.add(0, null);
         boundariesList.add(boundariesList.size() - 1, null);
 
@@ -509,8 +533,8 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
         disableAll(indexes);
         // Duplicate entry, causing empty fragments
         boundariesList.add(7, boundariesList.get(7));
-        boundariesList.add(10, boundariesList.get(10));
-        boundariesList.add(10, boundariesList.get(10));
+        boundariesList.add(10, boundariesList.get(9));
+        boundariesList.add(10, boundariesList.get(9));
 
         // Build and validate
         IntStream.rangeClosed(0, 3).parallel().forEach(ignore ->
@@ -519,6 +543,7 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
         validateIndexes(indexes);
 
         // pad with nulls, causing more empty fragments
+        disableAll(indexes);
         boundariesList.add(0, null);
         boundariesList.add(boundariesList.size() - 1, null);
 
@@ -557,6 +582,16 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
         Collections.shuffle(partialShuffled);
         squashed = IndexingMutuallyByRecords.sortAndSquash(partialShuffled);
         assertEquals(partial, squashed);
+
+        // test sparse overlaps
+        List<Range> sparse = new ArrayList<>(Arrays.asList(rangeOf(0, 9), rangeOf(20, 29), rangeOf(100, 110)));
+        List<Range> sparseShuffled = new ArrayList<>(Arrays.asList(
+                rangeOf(0, 7), rangeOf(3, 4), rangeOf(1, 8), rangeOf(8, 9),
+                rangeOf(20, 21), rangeOf(21, 29),
+                rangeOf(100, 110), rangeOf(100, 101), rangeOf(101, 108)));
+        Collections.shuffle(sparseShuffled);
+        squashed = IndexingMutuallyByRecords.sortAndSquash(sparseShuffled);
+        assertEquals(sparse, squashed);
     }
 
     @Test
@@ -628,5 +663,306 @@ public class OnlineIndexerMutualTest extends OnlineIndexerTest  {
 
     private static byte[] byteEmpty() {
         return new byte[0];
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            // numRecords must be even
+            "false, 3, 100, 7",
+            "true, 12, 150, 9",
+            "true, 5, 140, 14",
+            "false, 5, 78, 14",
+            "true, 20, 202, 14",
+    })
+    void testUniquenessMultiTarget(boolean allowUniquePending, int numThreads, int numRecords, int boundarySize) {
+        assertEquals(0, (numRecords & 1)); // must be an even number
+        List<TestRecords1Proto.MySimpleRecord> records = LongStream.range(0, numRecords).mapToObj( val ->
+                TestRecords1Proto.MySimpleRecord.newBuilder().setRecNo(val)
+                        .setNumValue2(((int)val) % (numRecords / 2))
+                        .setNumValue3Indexed((int) val * 7)
+                        .setNumValueUnique((int)val * 119)
+                        .build()
+        ).collect(Collectors.toList());
+
+        List<Index> indexes = new ArrayList<>();
+        indexes.add(new Index("indexA", field("num_value_2"), EmptyKeyExpression.EMPTY, IndexTypes.VALUE, IndexOptions.UNIQUE_OPTIONS));
+        indexes.add(new Index("indexB", field("num_value_3_indexed"), IndexTypes.VALUE));
+        indexes.add(new Index("indexC", field("num_value_unique"), EmptyKeyExpression.EMPTY, IndexTypes.VALUE, IndexOptions.UNIQUE_OPTIONS));
+        FDBRecordStoreTestBase.RecordMetaDataHook hook = allIndexesHook(indexes);
+
+        openSimpleMetaData();
+        try (FDBRecordContext context = openContext())  {
+            records.forEach(recordStore::saveRecord);
+            context.commit();
+        }
+        // build indexes, "indexA" should have a uniqueness violation
+        openSimpleMetaData(hook);
+        disableAll(indexes);
+        final List<Tuple> boundaries = getBoundariesList(numRecords, boundarySize);
+        IntStream range = IntStream.rangeClosed(0, numThreads);
+        range.parallel().forEach(ignore -> {
+            openSimpleMetaData(allIndexesHook(indexes));
+            try (OnlineIndexer indexBuilder = newIndexerBuilder()
+                    .setTargetIndexes(indexes)
+                    .setIndexingPolicy(OnlineIndexer.IndexingPolicy.newBuilder()
+                            .setMutualIndexingBoundaries(boundaries)
+                            .allowUniquePendingState(allowUniquePending))
+                    .build()) {
+                if (allowUniquePending) {
+                    indexBuilder.buildIndex();
+                } else {
+                    buildIndexAssertThrowUniquenessViolationOrValidation(indexBuilder);
+                }
+            }
+        });
+
+        try (FDBRecordContext context = openContext()) {
+            // unique index with uniqueness violation:
+            assertEquals(numRecords, (int)recordStore.scanUniquenessViolations(indexes.get(0)).getCount().join());
+            if (allowUniquePending) {
+                assertTrue(recordStore.isIndexReadableUniquePending(indexes.get(0)));
+                final List<IndexEntry> scanned = recordStore.scanIndex(indexes.get(0), IndexScanType.BY_VALUE, TupleRange.ALL, null, ScanProperties.FORWARD_SCAN)
+                        .asList().join();
+                assertEquals(scanned.size(), records.size());
+                List<Long> numValues = records.stream().map(TestRecords1Proto.MySimpleRecord::getNumValue2).map(Integer::longValue).collect(Collectors.toList());
+                List<Long> scannedValues = scanned.stream().map(IndexEntry::getKey).map(tuple -> tuple.getLong(0)).collect(Collectors.toList());
+                assertTrue(numValues.containsAll(scannedValues));
+                assertTrue(scannedValues.containsAll(numValues));
+            } else {
+                assertTrue(recordStore.isIndexWriteOnly(indexes.get(0)));
+                RecordCoreException e = assertThrows(ScanNonReadableIndexException.class,
+                        () -> recordStore.scanIndex(indexes.get(0), IndexScanType.BY_VALUE, TupleRange.ALL, null, ScanProperties.FORWARD_SCAN));
+                assertTrue(e.getMessage().contains("Cannot scan non-readable index"));
+            }
+            // non-unique index:
+            assertTrue(recordStore.isIndexReadable(indexes.get(1)));
+            // unique index of unique numbers:
+            assertTrue(recordStore.isIndexReadable(indexes.get(2)));
+            context.commit();
+        }
+
+        // now try resolving the duplications, and marking readable with another build
+        final Index index = indexes.get(0);
+        try (FDBRecordContext context = openContext()) {
+            Set<Tuple> indexEntries = new HashSet<>(recordStore.scanUniquenessViolations(index)
+                    .map( v -> v.getIndexEntry().getKey() )
+                    .asList().join());
+
+            for (Tuple indexKey : indexEntries) {
+                List<Tuple> primaryKeys = recordStore.scanUniquenessViolations(index, indexKey).map(RecordIndexUniquenessViolation::getPrimaryKey).asList().join();
+                assertEquals(2, primaryKeys.size());
+                recordStore.resolveUniquenessViolation(index, indexKey, primaryKeys.get(0)).join();
+                assertEquals(0, (int)recordStore.scanUniquenessViolations(index, indexKey).getCount().join());
+            }
+
+            for (int i = 0; i < numRecords / 2; i++) {
+                assertNotNull(recordStore.loadRecord(Tuple.from(i)));
+            }
+            for (int i = numRecords / 2; i < records.size(); i++) {
+                assertNull(recordStore.loadRecord(Tuple.from(i)));
+            }
+            context.commit();
+        }
+        openSimpleMetaData(hook);
+        openSimpleMetaData(allIndexesHook(indexes));
+        try (OnlineIndexer indexBuilder = newIndexerBuilder()
+                .setIndex(index)
+                .setIndexingPolicy(OnlineIndexer.IndexingPolicy.newBuilder()
+                        .allowTakeoverContinue()
+                        .allowUniquePendingState(allowUniquePending))
+                .build()) {
+            indexBuilder.buildIndex();
+        }
+        assertAllReadable(indexes);
+    }
+
+    private void buildIndexAssertThrowUniquenessViolationOrValidation(OnlineIndexer indexer) {
+        indexer.buildIndexAsync().handle((ignore, e) -> {
+            assertNotNull(e);
+            RuntimeException runE = FDBExceptions.wrapException(e);
+            assertNotNull(runE);
+            assertTrue(runE instanceof RecordIndexUniquenessViolation ||
+                       runE instanceof IndexingBase.ValidationException);
+            return null;
+        }).join();
+    }
+
+    @Test
+    void testMultiTargetMismatchStateFailure() {
+        //Throw when one index has a different status
+        final long numRecords = 40;
+
+        List<Index> indexes = new ArrayList<>();
+        // Here: Value indexes only
+        indexes.add(new Index("indexC", field("num_value_unique"), EmptyKeyExpression.EMPTY, IndexTypes.VALUE, IndexOptions.UNIQUE_OPTIONS));
+        indexes.add(new Index("indexD", new GroupingKeyExpression(EmptyKeyExpression.EMPTY, 0), IndexTypes.COUNT));
+        indexes.add(new Index("indexA", field("num_value_2"), EmptyKeyExpression.EMPTY, IndexTypes.VALUE, IndexOptions.UNIQUE_OPTIONS));
+
+        openSimpleMetaData();
+        populateData(numRecords);
+
+        FDBRecordStoreTestBase.RecordMetaDataHook hook = allIndexesHook(indexes);
+        openSimpleMetaData(hook);
+        disableAll(indexes);
+
+        // built one index
+        try (OnlineIndexer indexer = newIndexerBuilder()
+                .setIndex(indexes.get(1))
+                .build()) {
+            indexer.buildIndex(false);
+        }
+
+        // assert multi target failures
+        final List<Tuple> boundaries = getBoundariesList(numRecords, 4);
+        IntStream range = IntStream.rangeClosed(0, 10);
+        range.parallel().forEach(ignore -> {
+            openSimpleMetaData(allIndexesHook(indexes));
+            try (OnlineIndexer indexBuilder = newIndexerBuilder()
+                    .setTargetIndexes(indexes)
+                    .setIndexingPolicy(OnlineIndexer.IndexingPolicy.newBuilder()
+                            .setMutualIndexingBoundaries(boundaries))
+                    .build()) {
+                RecordCoreException e = assertThrows(RecordCoreException.class, indexBuilder::buildIndex);
+                assertTrue(e.getMessage().contains("A target index state doesn't match the primary index state"));
+            }
+        });
+    }
+
+    @Test
+    void testMultiTargetPartlyBuildFailure() {
+        // Throw when one index has a different type stamp
+        final int numRecords = 107;
+
+        List<Index> indexes = new ArrayList<>();
+        indexes.add(new Index("indexD", new GroupingKeyExpression(EmptyKeyExpression.EMPTY, 0), IndexTypes.COUNT));
+        indexes.add(new Index("indexA", field("num_value_2"), EmptyKeyExpression.EMPTY, IndexTypes.VALUE, IndexOptions.UNIQUE_OPTIONS));
+        indexes.add(new Index("indexB", field("num_value_3_indexed"), IndexTypes.VALUE));
+        indexes.add(new Index("indexC", field("num_value_unique"), EmptyKeyExpression.EMPTY, IndexTypes.VALUE, IndexOptions.UNIQUE_OPTIONS));
+
+        openSimpleMetaData();
+        populateData(numRecords);
+
+        FDBRecordStoreTestBase.RecordMetaDataHook hook = allIndexesHook(indexes);
+        openSimpleMetaData(hook);
+        disableAll(indexes);
+
+        final List<Tuple> boundaries = getBoundariesList(numRecords, 4);
+        // 1. partly build multi
+        IntStream.rangeClosed(0, 10).parallel().forEach(ignore -> buildIndexAndCrashHalfway(indexes, boundaries, indexes));
+
+        // 2. let one index continue ahead
+        buildIndexAndCrashHalfway(indexes.subList(0, 1), null, indexes); // null do no imply mutual indexing
+
+        // 3. assert mismatch type stamp
+        IntStream.rangeClosed(0, 10).parallel().forEach(ignore -> {
+            openSimpleMetaData(allIndexesHook(indexes));
+            try (OnlineIndexer indexBuilder = newIndexerBuilder()
+                    .setTargetIndexes(indexes)
+                    .setIndexingPolicy(OnlineIndexer.IndexingPolicy.newBuilder()
+                            .setIfMismatchPrevious(OnlineIndexer.IndexingPolicy.DesiredAction.ERROR)
+                            .setMutualIndexingBoundaries(boundaries))
+                    .build()) {
+                RecordCoreException e = assertThrows(RecordCoreException.class, indexBuilder::buildIndex);
+                assertTrue(e.getMessage().contains("This index was partly built by another method"));
+            }
+        });
+    }
+
+    @Test
+    void testMultiTargetPartlyBuildChangeTargets() {
+        // Throw when the index list changes
+        final int numRecords = 107;
+
+        List<Index> indexes = new ArrayList<>();
+        indexes.add(new Index("indexD", new GroupingKeyExpression(EmptyKeyExpression.EMPTY, 0), IndexTypes.COUNT));
+        indexes.add(new Index("indexA", field("num_value_2"), EmptyKeyExpression.EMPTY, IndexTypes.VALUE, IndexOptions.UNIQUE_OPTIONS));
+        indexes.add(new Index("indexB", field("num_value_3_indexed"), IndexTypes.VALUE));
+        indexes.add(new Index("indexC", field("num_value_unique"), EmptyKeyExpression.EMPTY, IndexTypes.VALUE, IndexOptions.UNIQUE_OPTIONS));
+
+        openSimpleMetaData();
+        populateData(numRecords);
+
+        FDBRecordStoreTestBase.RecordMetaDataHook hook = allIndexesHook(indexes);
+        openSimpleMetaData(hook);
+        disableAll(indexes);
+        final List<Tuple> boundaries = getBoundariesList(numRecords, 4);
+
+        // 1. partly build multi
+        IntStream.rangeClosed(0, 8).parallel().forEach(ignore -> buildIndexAndCrashHalfway(indexes, boundaries, indexes));
+
+        // 2. Change indexes set
+        indexes.remove(1);
+
+        // 3. assert mismatch type stamp
+        IntStream.rangeClosed(0, 12).parallel().forEach(ignore -> {
+            openSimpleMetaData(allIndexesHook(indexes));
+            try (OnlineIndexer indexBuilder = newIndexerBuilder()
+                    .setTargetIndexes(indexes)
+                    .setIndexingPolicy(OnlineIndexer.IndexingPolicy.newBuilder()
+                            .setIfMismatchPrevious(OnlineIndexer.IndexingPolicy.DesiredAction.ERROR)
+                            .setMutualIndexingBoundaries(boundaries))
+                    .build()) {
+                RecordCoreException e = assertThrows(RecordCoreException.class, indexBuilder::buildIndex);
+                assertTrue(e.getMessage().contains("This index was partly built by another method"));
+            }
+        });
+    }
+
+    private void buildIndexAndCrashHalfway(List<Index> indexes, List<Tuple> boundaries, List<Index> indexesHook) {
+        // Force a RecordCoreException failure
+        final String throwMsg = "Intentionally crash during test";
+        openSimpleMetaData(allIndexesHook(indexesHook));
+        try (OnlineIndexer indexBuilder = newIndexerBuilder()
+                .setTargetIndexes(indexes)
+                .setIndexingPolicy(OnlineIndexer.IndexingPolicy.newBuilder()
+                        .setMutualIndexingBoundaries(boundaries))
+                .setLimit(1)
+                .setConfigLoader(old -> {
+                    throw new RecordCoreException(throwMsg);
+                })
+                .build()) {
+
+            RecordCoreException e = assertThrows(RecordCoreException.class, indexBuilder::buildIndex);
+            assertTrue(e.getMessage().contains(throwMsg));
+            // The index should be partially built
+        }
+    }
+
+    @Test
+    void testMultiTargetMultiType() {
+        // Use different record types
+        final int numRecords = 32;
+        final int numRecordsOther = 124;
+        final long start = 100;
+
+        openSimpleMetaData();
+        populateData(numRecords);
+        populateOtherData(numRecordsOther, start);
+
+        Index indexMyA = new Index("indexMyA", field("num_value_2"), EmptyKeyExpression.EMPTY, IndexTypes.VALUE, IndexOptions.UNIQUE_OPTIONS);
+        Index indexMyB = new Index("indexMyB", field("num_value_unique"), EmptyKeyExpression.EMPTY, IndexTypes.VALUE, IndexOptions.UNIQUE_OPTIONS);
+        Index indexOtherA = new Index("indexOtherA", field("num_value_2"), IndexTypes.VALUE);
+        Index indexOtherB = new Index("indexOtherB", field("num_value_2"), IndexTypes.VALUE);
+        final List<Index> indexes = Arrays.asList(indexMyA, indexMyB, indexOtherA, indexOtherB);
+
+        // build indexes
+        final List<Tuple> boundaries = getBoundariesList(start + numRecordsOther, 30);
+        IntStream.rangeClosed(0, 8).parallel().forEach(ignore -> {
+            FDBRecordStoreTestBase.RecordMetaDataHook hook = metaDataBuilder -> {
+                metaDataBuilder.addIndex("MySimpleRecord", indexMyA);
+                metaDataBuilder.addIndex("MySimpleRecord", indexMyB);
+                metaDataBuilder.addIndex("MyOtherRecord", indexOtherA);
+                metaDataBuilder.addIndex("MyOtherRecord", indexOtherB);
+            };
+            openSimpleMetaData(hook);
+            try (OnlineIndexer indexBuilder = newIndexerBuilder()
+                    .setTargetIndexes(indexes)
+                    .setIndexingPolicy(OnlineIndexer.IndexingPolicy.newBuilder()
+                            .setMutualIndexingBoundaries(boundaries))
+                    .build()) {
+                indexBuilder.buildIndex(true);
+            }
+        });
+        validateIndexes(indexes);
     }
 }
