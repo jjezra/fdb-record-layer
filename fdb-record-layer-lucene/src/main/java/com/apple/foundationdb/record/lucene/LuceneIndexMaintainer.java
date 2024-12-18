@@ -58,8 +58,10 @@ import com.apple.foundationdb.record.provider.foundationdb.IndexMaintainerState;
 import com.apple.foundationdb.record.provider.foundationdb.IndexOperation;
 import com.apple.foundationdb.record.provider.foundationdb.IndexOperationResult;
 import com.apple.foundationdb.record.provider.foundationdb.IndexScanBounds;
+import com.apple.foundationdb.record.provider.foundationdb.IndexScrubbingTools;
 import com.apple.foundationdb.record.provider.foundationdb.indexes.InvalidIndexEntry;
 import com.apple.foundationdb.record.provider.foundationdb.indexes.StandardIndexMaintainer;
+import com.apple.foundationdb.record.provider.foundationdb.indexes.ValueIndexScrubbingToolsMissing;
 import com.apple.foundationdb.record.query.QueryToKeyMatcher;
 import com.apple.foundationdb.tuple.Tuple;
 import com.google.common.annotations.VisibleForTesting;
@@ -748,6 +750,19 @@ public class LuceneIndexMaintainer extends StandardIndexMaintainer {
                 // Not thread safe but OK as we may only log an extra message
                 serializerErrorLogged = true;
             }
+        }
+    }
+
+    @Nullable
+    @Override
+    public IndexScrubbingTools<?> getIndexScrubbingTools(final IndexScrubbingTools.ScrubbingType type) {
+        switch (type) {
+            case MISSING:
+                return new LuceneIndexScrubbingToolsMissing(partitioner, state);
+            case DANGLING:
+                return new LuceneIndexScrubbingToolsDangling(partitioner, state);
+            default:
+                return null;
         }
     }
 }
