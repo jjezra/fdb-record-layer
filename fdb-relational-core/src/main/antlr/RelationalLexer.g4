@@ -626,6 +626,8 @@ PROFILES:                            'PROFILES';
 PROXY:                               'PROXY';
 QUERY:                               'QUERY';
 QUICK:                               'QUICK';
+READ_ONLY:                           'READ_ONLY';
+READ_WRITE:                          'READ_WRITE';
 REBUILD:                             'REBUILD';
 RECOVER:                             'RECOVER';
 REDO_BUFFER_SIZE:                    'REDO_BUFFER_SIZE';

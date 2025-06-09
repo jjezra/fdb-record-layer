@@ -336,6 +336,16 @@ public class BaseVisitor extends AbstractParseTreeVisitor<Object> implements Typ
         return ddlVisitor.visitDropSchemaStatement(ctx);
     }
 
+    @Override
+    public Object visitAlterDatabaseSetState(final RelationalParser.AlterDatabaseSetStateContext ctx) {
+        return ddlVisitor.visitAlterDatabaseSetState(ctx);
+    }
+
+    @Override
+    public Object visitDatabaseState(final RelationalParser.DatabaseStateContext ctx) {
+        return visitChildren(ctx);
+    }
+
     @Nonnull
     @Override
     public RecordLayerTable visitStructDefinition(@Nonnull RelationalParser.StructDefinitionContext ctx) {

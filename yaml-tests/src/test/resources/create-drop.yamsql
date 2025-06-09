@@ -214,8 +214,12 @@ test_block:
       - query: select count(*) from "DATABASES" where database_id = '/FRL/DB'
       - result: [{0}]
     -
+      - query: alter database set read_only
+    -
       - query: select count(*) from "SCHEMAS" where database_id = '/FRL/DB'
       - result: [{0}]
+    -
+      - query: alter database set read_write
 ---
 setup:
   connect: "jdbc:embed:/__SYS?schema=CATALOG"

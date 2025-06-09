@@ -170,6 +170,16 @@ public class DelegatingVisitor<D extends TypedVisitor> implements TypedVisitor {
         return getDelegate().visitDropSchemaStatement(ctx);
     }
 
+    @Override
+    public Object visitAlterDatabaseSetState(final RelationalParser.AlterDatabaseSetStateContext ctx) {
+        return getDelegate().visitAlterDatabaseSetState(ctx);
+    }
+
+    @Override
+    public Object visitDatabaseState(final RelationalParser.DatabaseStateContext ctx) {
+        return getDelegate().visitDatabaseState(ctx);
+    }
+
     @Nonnull
     @Override
     public RecordLayerTable visitStructDefinition(@Nonnull RelationalParser.StructDefinitionContext ctx) {

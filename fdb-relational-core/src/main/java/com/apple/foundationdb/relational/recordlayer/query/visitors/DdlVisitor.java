@@ -310,6 +310,11 @@ public final class DdlVisitor extends DelegatingVisitor<BaseVisitor> {
                 throwIfDoesNotExist, Options.NONE));
     }
 
+    @Override
+    public Object visitAlterDatabaseSetState(final RelationalParser.AlterDatabaseSetStateContext ctx) {
+        return null;
+    }
+
     @Nonnull
     private RecordLayerInvokedRoutine getInvokedRoutineMetadata(@Nonnull final RelationalParser.SqlInvokedFunctionContext ctx) {
         final var ddlCatalog = metadataBuilder.build();

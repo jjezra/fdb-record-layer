@@ -57,6 +57,7 @@ dmlStatement
 ddlStatement
     : createStatement
     | dropStatement
+    | alterStatement
     ;
 
 transactionStatement
@@ -111,6 +112,15 @@ dropStatement
    : DROP DATABASE ifExists? path       #dropDatabaseStatement
    | DROP SCHEMA TEMPLATE ifExists? uid #dropSchemaTemplateStatement
    | DROP SCHEMA ifExists? uid          #dropSchemaStatement
+   ;
+
+alterStatement
+   : ALTER DATABASE SET databaseState    #alterDatabaseSetState
+   ;
+
+databaseState
+   : READ_WRITE
+   | READ_ONLY
    ;
 
 // details
