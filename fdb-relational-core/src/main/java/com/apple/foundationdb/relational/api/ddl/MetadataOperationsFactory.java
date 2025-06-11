@@ -47,4 +47,7 @@ public interface MetadataOperationsFactory {
 
     @Nonnull
     ConstantAction getDropSchemaConstantAction(@Nonnull URI dbPath, @Nonnull String schemaName, @Nonnull Options options);
+
+    @Nonnull
+    ConstantAction alterStoreStateAction(@Nonnull URI dbUrl, @Nonnull Options options);
 }

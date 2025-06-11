@@ -312,7 +312,9 @@ public final class DdlVisitor extends DelegatingVisitor<BaseVisitor> {
 
     @Override
     public Object visitAlterDatabaseSetState(final RelationalParser.AlterDatabaseSetStateContext ctx) {
-        return null;
+        final var databaseId = visitUid(ctx.path().uid());
+        SemanticAnalyzer.validateDatabaseUri(databaseId);
+        return  ProceduralPlan.of(metadataOperationsFactory.alterStoreStateAction(URI.create(databaseId.getName()), Options.NONE));
     }
 
     @Nonnull

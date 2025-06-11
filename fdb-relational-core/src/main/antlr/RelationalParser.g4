@@ -115,7 +115,7 @@ dropStatement
    ;
 
 alterStatement
-   : ALTER DATABASE SET databaseState    #alterDatabaseSetState
+   : ALTER DATABASE path SET databaseState    #alterDatabaseSetState
    ;
 
 databaseState

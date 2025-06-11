@@ -74,6 +74,12 @@ public final class NoOpMetadataOperationsFactory implements MetadataOperationsFa
         return NoOpConstantAction.INSTANCE;
     }
 
+    @Nonnull
+    @Override
+    public ConstantAction alterStoreStateAction(@Nonnull final URI dbUrl, @Nonnull final Options options) {
+        return NoOpConstantAction.INSTANCE;
+    }
+
     private static class NoOpConstantAction implements ConstantAction {
         private static final NoOpConstantAction INSTANCE = new NoOpConstantAction();
 

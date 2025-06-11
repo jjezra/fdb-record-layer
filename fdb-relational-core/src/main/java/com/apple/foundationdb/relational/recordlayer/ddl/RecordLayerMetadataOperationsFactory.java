@@ -88,6 +88,12 @@ public class RecordLayerMetadataOperationsFactory implements MetadataOperationsF
         return new RecordLayerSetStoreStateConstantAction(dbUri, schemaName, rlConfig, baseKeySpace, catalog);
     }
 
+    @Nonnull
+    @Override
+    public ConstantAction alterStoreStateAction(@Nonnull final URI dbUrl, @Nonnull final Options options) {
+        return new AlterStoreStateAction();
+    }
+
     public static class Builder {
         protected StoreCatalog storeCatalog;
         protected RecordLayerConfig rlConfig;

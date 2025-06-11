@@ -205,6 +205,9 @@ setup:
   connect: "jdbc:embed:/__SYS?schema=CATALOG"
   steps:
     - query: drop database /frl/db
+    - query: create database /frl/db
+    - query: create schema /frl/db/s1 with template temp2
+    - query: alter database /fri/db set read_only
 ---
 test_block:
   connect: "jdbc:embed:/__SYS?schema=CATALOG"
@@ -212,14 +215,12 @@ test_block:
   tests:
     -
       - query: select count(*) from "DATABASES" where database_id = '/FRL/DB'
-      - result: [{0}]
-    -
-      - query: alter database set read_only
+      - result: [{1}]
     -
       - query: select count(*) from "SCHEMAS" where database_id = '/FRL/DB'
-      - result: [{0}]
+      - result: [{1}]
     -
-      - query: alter database set read_write
+      - query: alter database /fri/db set read_write
 ---
 setup:
   connect: "jdbc:embed:/__SYS?schema=CATALOG"
