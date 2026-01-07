@@ -1209,7 +1209,7 @@ public class FDBDirectory extends FDBDirectoryBase {
      * @param context the FDB record context (caller can use agilityContext accept, but function must use one context)
      * @throws RecordCoreException if the pending write queue is not empty
      */
-    public void clearUseQueue(@Nonnull FDBRecordContext context) {
+    public void clearUseQueueFailIfNonEmpty(@Nonnull FDBRecordContext context) {
         final Subspace ongoingMergeSubspace = subspace.subspace(Tuple.from(ONGOING_MERGE_INDICATOR_SUBSPACE));
         final Subspace queueSubspace = subspace.subspace(Tuple.from(PENDING_WRITE_QUEUE_SUBSPACE));
         final Range queueRange = queueSubspace.range();

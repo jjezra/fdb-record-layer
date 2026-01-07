@@ -289,6 +289,7 @@ public class FDBDirectoryManager implements AutoCloseable {
                                       @Nonnull final AgilityContext agilityContext) {
         try (FDBDirectoryWrapper directoryWrapper = createDirectoryWrapper(groupingKey, partitionId, agilityContext)) {
             try {
+                // Indicate to all IO that the queue should be used
                 agilityContext.accept(context -> directoryWrapper.getDirectory().setUseQueue(context));
                 directoryWrapper.mergeIndex();
                 if (LOGGER.isDebugEnabled()) {
@@ -301,7 +302,10 @@ public class FDBDirectoryManager implements AutoCloseable {
                         LuceneLogMessageKeys.GROUP, groupingKey,
                         LuceneLogMessageKeys.INDEX_PARTITION, partitionId);
             } finally {
-                // directoryWrapper.drainQueue();
+                // Here: drain this partition's queue and clear the "use queue" indicator
+                // todo: retry if fails to clear queue
+                directoryWrapper.getPendingWriteQueue().drainQueueIntoIndex(groupingKey, partitionId, agilityContext);
+                agilityContext.accept(context -> directoryWrapper.getDirectory().clearUseQueueFailIfNonEmpty(context));
             }
         } catch (IOException e) {
             // there was an IOException closing the index writer

@@ -24,6 +24,7 @@ import com.apple.foundationdb.KeyValue;
 import com.apple.foundationdb.MutationType;
 import com.apple.foundationdb.Range;
 import com.apple.foundationdb.annotation.API;
+import com.apple.foundationdb.record.lucene.directory.AgilityContext;
 import com.apple.foundationdb.record.provider.foundationdb.FDBRecordContext;
 import com.apple.foundationdb.subspace.Subspace;
 import com.apple.foundationdb.tuple.Tuple;
@@ -290,6 +291,39 @@ public class LucenePendingWriteQueue {
                 } catch (IOException e) {
                     throw LuceneExceptions.toRecordCoreException("Failed to apply queue operation", e);
                 }
+            });
+            clearQueue();
+        });
+    }
+
+    public CompletableFuture<Void> drainQueueIntoIndex(final Tuple groupingKey, final Integer partitionId, AgilityContext aContext) {
+        return getQueuedOperations().thenAccept(queueOps -> {
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("Draining {} queued operations", queueOps.size());
+            }
+            queueOps.forEach(op -> {
+                aContext.accept(context -> {
+                    // Ohad:
+                    // Here: need to create a new index maintainer with the context from agility context. This may be a little tricky
+                    LuceneIndexMaintainer indexMaintainer = null;
+                    try {
+                        switch (op.getOperationType()) {
+                            case UPDATE:
+                                // need to delete the doc first
+                            case INSERT:
+                                final List<LuceneDocumentFromRecord.DocumentField> documentFields = convertFromProtoFields(op.getFields());
+                                indexMaintainer.writeDocumentWithoutLock(documentFields, groupingKey, partitionId, op.getPrimaryKey());
+                                break;
+                            case DELETE:
+                                indexMaintainer.deleteDocumentWithoutLock(groupingKey, partitionId, op.getPrimaryKey());
+                                break;
+                            default:
+                                throw new IllegalStateException("Unexpected value: " + op.getOperationType());
+                        }
+                    } catch (IOException e) {
+                        throw LuceneExceptions.toRecordCoreException("Failed to apply queue operation", e);
+                    }
+                });
             });
             clearQueue();
         });
