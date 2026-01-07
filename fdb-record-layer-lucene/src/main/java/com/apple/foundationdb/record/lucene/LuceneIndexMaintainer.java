@@ -262,7 +262,7 @@ public class LuceneIndexMaintainer extends StandardIndexMaintainer {
                                Integer partitionId,
                                Tuple primaryKey,
                                OverallOperation overallOperation) throws IOException {
-        if (isPartitionLocked(groupingKey, partitionId)) {
+        if (shouldUseQueue(groupingKey, partitionId)) {
             // Partition is locked during merge - enqueue the insert/update operation
             LucenePendingWriteQueue queue = getPendingWriteQueue(groupingKey, partitionId);
             switch (overallOperation) {
@@ -524,6 +524,7 @@ public class LuceneIndexMaintainer extends StandardIndexMaintainer {
     @Override
     public CompletableFuture<Void> mergeIndex() {
         return drainAllQueues()
+                // Ohad - why draining the queues *before* merge? And why draining all queues and not one partition at a time (right after merge)?
                 .thenCompose(ignore -> rebalancePartitions())
                 .thenCompose(ignored -> {
                     state.store.getIndexDeferredMaintenanceControl().setLastStep(IndexDeferredMaintenanceControl.LastStep.MERGE);
@@ -751,7 +752,7 @@ public class LuceneIndexMaintainer extends StandardIndexMaintainer {
             // non-partitioned
             if (!partitioner.isPartitioningEnabled()) {
                 // TODO: Convert ot future.thenApply
-                if (isPartitionLocked(groupingKey, null)) {
+                if (shouldUseQueue(groupingKey, null)) {
                     // Index is locked during merge - enqueue the delete operation
                     LucenePendingWriteQueue queue = getPendingWriteQueue(groupingKey, null);
                     switch (overallOperation) {
@@ -782,7 +783,7 @@ public class LuceneIndexMaintainer extends StandardIndexMaintainer {
             }
 
             // TODO: convert to future.thenApply
-            if (isPartitionLocked(groupingKey, partitionInfo.getId())) {
+            if (shouldUseQueue(groupingKey, partitionInfo.getId())) {
                 // TODO: This seems to be locked when building the index. Need to check
                 // Partition is locked during merge - enqueue the delete operation
                 LucenePendingWriteQueue queue = getPendingWriteQueue(groupingKey, partitionInfo.getId());
@@ -1022,11 +1023,10 @@ public class LuceneIndexMaintainer extends StandardIndexMaintainer {
         }
     }
 
-    private boolean isPartitionLocked(Tuple groupingKey, Integer partitionId) {
-        // TODO: Need to queue items when queue is not empty as well?
+    private boolean shouldUseQueue(Tuple groupingKey, Integer partitionId) {
         FDBDirectory directory = directoryManager.getDirectory(groupingKey, partitionId);
         // Check the standard Lucene IndexWriter lock
-        return directory.isLocked("write.lock");
+        return directory.shouldUseQueue();
     }
 
     /**

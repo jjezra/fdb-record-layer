@@ -229,7 +229,7 @@ public class FDBDirectoryWrapper implements AutoCloseable {
 
     @Nonnull
     protected LucenePendingWriteQueue createPendingWriteQueue() {
-        Subspace queueSubspace = directory.getSubspace().get(FDBDirectory.PENDING_WRITE_QUEUE_SUBSPACE);
+        Subspace queueSubspace = directory.getPendingWriteQueueSubspace();
         return new LucenePendingWriteQueue(state.context, queueSubspace);
     }
 

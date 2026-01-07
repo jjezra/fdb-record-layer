@@ -289,6 +289,7 @@ public class FDBDirectoryManager implements AutoCloseable {
                                       @Nonnull final AgilityContext agilityContext) {
         try (FDBDirectoryWrapper directoryWrapper = createDirectoryWrapper(groupingKey, partitionId, agilityContext)) {
             try {
+                agilityContext.accept(context -> directoryWrapper.getDirectory().setUseQueue(context));
                 directoryWrapper.mergeIndex();
                 if (LOGGER.isDebugEnabled()) {
                     LOGGER.debug(KeyValueLogMessage.of("Lucene merge success",
@@ -299,6 +300,8 @@ public class FDBDirectoryManager implements AutoCloseable {
                 throw LuceneExceptions.toRecordCoreException("Lucene mergeIndex failed", e,
                         LuceneLogMessageKeys.GROUP, groupingKey,
                         LuceneLogMessageKeys.INDEX_PARTITION, partitionId);
+            } finally {
+                // directoryWrapper.drainQueue();
             }
         } catch (IOException e) {
             // there was an IOException closing the index writer
