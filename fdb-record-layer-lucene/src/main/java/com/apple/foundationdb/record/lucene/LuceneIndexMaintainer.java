@@ -282,33 +282,8 @@ public class LuceneIndexMaintainer extends StandardIndexMaintainer {
             }
             return;
         }
-        final long startTime = System.nanoTime();
-        Document document = new Document();
-        final IndexWriter newWriter = directoryManager.getIndexWriter(groupingKey, partitionId);
-
-        BytesRef ref = new BytesRef(keySerializer.asPackedByteArray(primaryKey));
-        // use packed Tuple for the Stored and Sorted fields
-        document.add(new StoredField(PRIMARY_KEY_FIELD_NAME, ref));
-        document.add(new SortedDocValuesField(PRIMARY_KEY_SEARCH_NAME, ref));
-        if (keySerializer.hasFormat()) {
-            try {
-                // Use BinaryPoint for fast lookup of ID when enabled
-                document.add(new BinaryPoint(PRIMARY_KEY_BINARY_POINT_NAME, keySerializer.asFormattedBinaryPoint(primaryKey)));
-            } catch (RecordCoreFormatException ex) {
-                // this can happen on format mismatch or encoding error
-                // just don't write the field, but allow the document to continue
-                logSerializationError("Failed to write using BinaryPoint encoded ID: {}", ex.getMessage());
-            }
-        }
-
-        Map<IndexOptions, List<LuceneDocumentFromRecord.DocumentField>> indexOptionsToFieldsMap = getIndexOptionsToFieldsMap(fields);
-        for (Map.Entry<IndexOptions, List<LuceneDocumentFromRecord.DocumentField>> entry : indexOptionsToFieldsMap.entrySet()) {
-            for (LuceneDocumentFromRecord.DocumentField field : entry.getValue()) {
-                insertField(field, document);
-            }
-        }
-        newWriter.addDocument(document);
-        state.context.record(LuceneEvents.Events.LUCENE_ADD_DOCUMENT, System.nanoTime() - startTime);
+        LuceneIndexMaintainerHelper.writeDocument(state.context, directoryManager, state.index, groupingKey, partitionId,
+                primaryKey, fields);
     }
 
     @Nonnull
@@ -325,6 +300,7 @@ public class LuceneIndexMaintainer extends StandardIndexMaintainer {
 
     @SuppressWarnings({"PMD.CloseResource", "java:S2095"})
     int deleteDocument(Tuple groupingKey, Integer partitionId, Tuple primaryKey) throws IOException {
+        // je: todo: move to helper
         final long startTime = System.nanoTime();
         final IndexWriter indexWriter = directoryManager.getIndexWriter(groupingKey, partitionId);
         @Nullable final LucenePrimaryKeySegmentIndex segmentIndex = directoryManager.getDirectory(groupingKey, partitionId).getPrimaryKeySegmentIndex();
