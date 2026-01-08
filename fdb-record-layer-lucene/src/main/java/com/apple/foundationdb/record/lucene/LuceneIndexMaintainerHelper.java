@@ -21,6 +21,7 @@
 package com.apple.foundationdb.record.lucene;
 
 import com.apple.foundationdb.record.RecordCoreArgumentException;
+import com.apple.foundationdb.record.logging.KeyValueLogMessage;
 import com.apple.foundationdb.record.lucene.directory.FDBDirectoryManager;
 import com.apple.foundationdb.record.lucene.idformat.LuceneIndexKeySerializer;
 import com.apple.foundationdb.record.lucene.idformat.RecordCoreFormatException;
@@ -39,14 +40,17 @@ import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.document.SortedDocValuesField;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.document.StringField;
+import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexOptions;
 import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.search.Query;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.NumericUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.EnumMap;
@@ -58,7 +62,85 @@ public class LuceneIndexMaintainerHelper {
     private static final Logger LOG = LoggerFactory.getLogger(LuceneIndexMaintainerHelper.class);
 
 
+    @SuppressWarnings({"PMD.CloseResource", "java:S2095"})
+    public static int deleteDocument(FDBRecordContext context,
+                                     FDBDirectoryManager directoryManager,
+                                     Index index,
+                                     Tuple groupingKey,
+                                     Integer partitionId,
+                                     Tuple primaryKey) throws IOException {
+        // je: todo: move to helper
+        final long startTime = System.nanoTime();
+        final IndexWriter indexWriter = directoryManager.getIndexWriter(groupingKey, partitionId);
+        String formatString = index.getOption(LuceneIndexOptions.PRIMARY_KEY_SERIALIZATION_FORMAT);
+        LuceneIndexKeySerializer keySerializer = LuceneIndexKeySerializer.fromStringFormat(formatString);
 
+        @Nullable final LucenePrimaryKeySegmentIndex segmentIndex = directoryManager.getDirectory(groupingKey, partitionId).getPrimaryKeySegmentIndex();
+
+        if (segmentIndex != null) {
+            final LucenePrimaryKeySegmentIndex.DocumentIndexEntry documentIndexEntry = getDocumentIndexEntryWithRetry(directoryManager, segmentIndex, groupingKey, partitionId, primaryKey);
+            if (documentIndexEntry != null) {
+                context.ensureActive().clear(documentIndexEntry.entryKey); // TODO: Only if valid?
+                long valid = indexWriter.tryDeleteDocument(documentIndexEntry.indexReader, documentIndexEntry.docId);
+                if (valid > 0) {
+                    context.record(LuceneEvents.Events.LUCENE_DELETE_DOCUMENT_BY_PRIMARY_KEY, System.nanoTime() - startTime);
+                    return 1;
+                } else if (LOG.isDebugEnabled()) {
+                    LOG.debug(KeyValueLogMessage.of("try delete document failed",
+                            LuceneLogMessageKeys.GROUP, groupingKey,
+                            LuceneLogMessageKeys.INDEX_PARTITION, partitionId,
+                            LuceneLogMessageKeys.SEGMENT, documentIndexEntry.segmentName,
+                            LuceneLogMessageKeys.DOC_ID, documentIndexEntry.docId,
+                            LuceneLogMessageKeys.PRIMARY_KEY, primaryKey));
+                }
+            } else if (LOG.isDebugEnabled()) {
+                LOG.debug(KeyValueLogMessage.of("primary key segment index entry not found",
+                        LuceneLogMessageKeys.GROUP, groupingKey,
+                        LuceneLogMessageKeys.INDEX_PARTITION, partitionId,
+                        LuceneLogMessageKeys.PRIMARY_KEY, primaryKey,
+                        LuceneLogMessageKeys.SEGMENTS, segmentIndex.findSegments(primaryKey)));
+            }
+        }
+        Query query;
+        // null format means don't use BinaryPoint for the index primary key
+        if (keySerializer.hasFormat()) {
+            try {
+                byte[][] binaryPoint = keySerializer.asFormattedBinaryPoint(primaryKey);
+                query = BinaryPoint.newRangeQuery(LuceneIndexMaintainer.PRIMARY_KEY_BINARY_POINT_NAME, binaryPoint, binaryPoint);
+            } catch (RecordCoreFormatException ex) {
+                // this can happen on format mismatch or encoding error
+                // fallback to the old way (less efficient)
+                query = SortedDocValuesField.newSlowExactQuery(LuceneIndexMaintainer.PRIMARY_KEY_SEARCH_NAME, new BytesRef(keySerializer.asPackedByteArray(primaryKey)));
+                logSerializationError("Failed to delete using BinaryPoint encoded ID: {}", ex.getMessage());
+            }
+        } else {
+            // fallback to the old way (less efficient)
+            query = SortedDocValuesField.newSlowExactQuery(LuceneIndexMaintainer.PRIMARY_KEY_SEARCH_NAME, new BytesRef(keySerializer.asPackedByteArray(primaryKey)));
+        }
+
+        indexWriter.deleteDocuments(query);
+        LuceneEvents.Events event = // state.store.isIndexWriteOnly(index) ? todo
+                                    // LuceneEvents.Events.LUCENE_DELETE_DOCUMENT_BY_QUERY_IN_WRITE_ONLY_MODE :
+                                    LuceneEvents.Events.LUCENE_DELETE_DOCUMENT_BY_QUERY;
+        context.record(event, System.nanoTime() - startTime);
+
+        // if we delete by query, we aren't certain whether the document was actually deleted (if, for instance, it wasn't in Lucene
+        // to begin with)
+        return 0;
+    }
+
+    @SuppressWarnings("PMD.CloseResource")
+    public static LucenePrimaryKeySegmentIndex.DocumentIndexEntry getDocumentIndexEntryWithRetry(FDBDirectoryManager directoryManager, LucenePrimaryKeySegmentIndex segmentIndex, final Tuple groupingKey, final Integer partitionId, final Tuple primaryKey) throws IOException {
+        DirectoryReader directoryReader = directoryManager.getWriterReader(groupingKey, partitionId, false);
+        LucenePrimaryKeySegmentIndex.DocumentIndexEntry documentIndexEntry = segmentIndex.findDocument(directoryReader, primaryKey);
+        if (documentIndexEntry != null) {
+            return documentIndexEntry;
+        } else {
+            // Use refresh to ensure the reader can see the latest deletes
+            directoryReader = directoryManager.getWriterReader(groupingKey, partitionId, true);
+            return segmentIndex.findDocument(directoryReader, primaryKey);
+        }
+    }
 
 
     public static void writeDocument(FDBRecordContext context,

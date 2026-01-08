@@ -118,8 +118,8 @@ public class LuceneIndexMaintainer extends StandardIndexMaintainer {
     private final FDBDirectoryManager directoryManager;
     private final LuceneAnalyzerCombinationProvider autoCompleteAnalyzerSelector;
     public static final String PRIMARY_KEY_FIELD_NAME = "_p";
-    protected static final String PRIMARY_KEY_SEARCH_NAME = "_s";
-    protected static final String PRIMARY_KEY_BINARY_POINT_NAME = "_b";
+    public static final String PRIMARY_KEY_SEARCH_NAME = "_s";
+    public static final String PRIMARY_KEY_BINARY_POINT_NAME = "_b";
     private final Executor executor;
     LuceneIndexKeySerializer keySerializer;
     private boolean serializerErrorLogged = false;
@@ -300,61 +300,7 @@ public class LuceneIndexMaintainer extends StandardIndexMaintainer {
 
     @SuppressWarnings({"PMD.CloseResource", "java:S2095"})
     int deleteDocument(Tuple groupingKey, Integer partitionId, Tuple primaryKey) throws IOException {
-        // je: todo: move to helper
-        final long startTime = System.nanoTime();
-        final IndexWriter indexWriter = directoryManager.getIndexWriter(groupingKey, partitionId);
-        @Nullable final LucenePrimaryKeySegmentIndex segmentIndex = directoryManager.getDirectory(groupingKey, partitionId).getPrimaryKeySegmentIndex();
-
-        if (segmentIndex != null) {
-            final LucenePrimaryKeySegmentIndex.DocumentIndexEntry documentIndexEntry = getDocumentIndexEntryWithRetry(segmentIndex, groupingKey, partitionId, primaryKey);
-            if (documentIndexEntry != null) {
-                state.context.ensureActive().clear(documentIndexEntry.entryKey); // TODO: Only if valid?
-                long valid = indexWriter.tryDeleteDocument(documentIndexEntry.indexReader, documentIndexEntry.docId);
-                if (valid > 0) {
-                    state.context.record(LuceneEvents.Events.LUCENE_DELETE_DOCUMENT_BY_PRIMARY_KEY, System.nanoTime() - startTime);
-                    return 1;
-                } else if (LOG.isDebugEnabled()) {
-                    LOG.debug(KeyValueLogMessage.of("try delete document failed",
-                            LuceneLogMessageKeys.GROUP, groupingKey,
-                            LuceneLogMessageKeys.INDEX_PARTITION, partitionId,
-                            LuceneLogMessageKeys.SEGMENT, documentIndexEntry.segmentName,
-                            LuceneLogMessageKeys.DOC_ID, documentIndexEntry.docId,
-                            LuceneLogMessageKeys.PRIMARY_KEY, primaryKey));
-                }
-            } else if (LOG.isDebugEnabled()) {
-                LOG.debug(KeyValueLogMessage.of("primary key segment index entry not found",
-                        LuceneLogMessageKeys.GROUP, groupingKey,
-                        LuceneLogMessageKeys.INDEX_PARTITION, partitionId,
-                        LuceneLogMessageKeys.PRIMARY_KEY, primaryKey,
-                        LuceneLogMessageKeys.SEGMENTS, segmentIndex.findSegments(primaryKey)));
-            }
-        }
-        Query query;
-        // null format means don't use BinaryPoint for the index primary key
-        if (keySerializer.hasFormat()) {
-            try {
-                byte[][] binaryPoint = keySerializer.asFormattedBinaryPoint(primaryKey);
-                query = BinaryPoint.newRangeQuery(PRIMARY_KEY_BINARY_POINT_NAME, binaryPoint, binaryPoint);
-            } catch (RecordCoreFormatException ex) {
-                // this can happen on format mismatch or encoding error
-                // fallback to the old way (less efficient)
-                query = SortedDocValuesField.newSlowExactQuery(PRIMARY_KEY_SEARCH_NAME, new BytesRef(keySerializer.asPackedByteArray(primaryKey)));
-                logSerializationError("Failed to delete using BinaryPoint encoded ID: {}", ex.getMessage());
-            }
-        } else {
-            // fallback to the old way (less efficient)
-            query = SortedDocValuesField.newSlowExactQuery(PRIMARY_KEY_SEARCH_NAME, new BytesRef(keySerializer.asPackedByteArray(primaryKey)));
-        }
-
-        indexWriter.deleteDocuments(query);
-        LuceneEvents.Events event = state.store.isIndexWriteOnly(state.index) ?
-                                    LuceneEvents.Events.LUCENE_DELETE_DOCUMENT_BY_QUERY_IN_WRITE_ONLY_MODE :
-                                    LuceneEvents.Events.LUCENE_DELETE_DOCUMENT_BY_QUERY;
-        state.context.record(event, System.nanoTime() - startTime);
-
-        // if we delete by query, we aren't certain whether the document was actually deleted (if, for instance, it wasn't in Lucene
-        // to begin with)
-        return 0;
+        return LuceneIndexMaintainerHelper.deleteDocument(state.context, directoryManager, state.index, groupingKey, partitionId, primaryKey);
     }
 
     /**
@@ -712,7 +658,6 @@ public class LuceneIndexMaintainer extends StandardIndexMaintainer {
     /**
      * Delete a given record if it is indexed.
      * The record may not necessarily exist in the index, or it may need to be deleted by query
-     * ({@link #deleteDocument(Tuple, Integer, Tuple)}).
      *
      * @param <M> record message
      * @param record record to be deleted
