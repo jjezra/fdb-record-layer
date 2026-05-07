@@ -1539,9 +1539,9 @@ public class FDBRecordStoreTest extends FDBRecordStoreTestBase {
                             boolean newStore, boolean rebuildRecordCounts,
                             @Nonnull Map<Index, List<RecordType>> indexes,
                             @Nullable RecordType singleRecordTypeWithPrefixKey) {
-                        recordStoreStateRef.get().beginRead();
+                        recordStoreIndexState.beginRead();
                         return MoreAsyncUtil.delayedFuture(100, TimeUnit.MILLISECONDS).thenApply(vignore -> {
-                            recordStoreStateRef.get().endRead();
+                            recordStoreIndexState.endRead();
                             return 0L; // Report empty store to allow inline rebuild
                         });
                     }
