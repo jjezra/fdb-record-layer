@@ -299,7 +299,7 @@ public abstract class IndexingBase {
         AtomicBoolean allReadable = new AtomicBoolean(true);
         return getRunner().runAsync(context -> openRecordStore(context).thenCompose(store ->
             forEachTargetIndex(index -> {
-                if (store.isIndexReadable(index)) {
+                if (store.getIndexState(index).isReadable()) {
                     return AsyncUtil.DONE;
                 }
                 final IndexingRangeSet rangeSet = IndexingRangeSet.forIndexBuild(store, index);

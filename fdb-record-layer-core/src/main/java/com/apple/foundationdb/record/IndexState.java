@@ -102,6 +102,14 @@ public enum IndexState {
         return this.equals(READABLE) || this.equals(READABLE_UNIQUE_PENDING);
     }
 
+    public boolean isReadable() {
+        return this.equals(READABLE);
+    }
+
+    public boolean isReadableUniquePending() {
+        return this.equals(READABLE_UNIQUE_PENDING);
+    }
+
     public boolean isWriteOnlyNoQueue() {
         return this.equals(WRITE_ONLY);
     }
@@ -112,6 +120,10 @@ public enum IndexState {
 
     public boolean isWriteOnly() {
         return isWriteOnlyNoQueue() || isWriteOnlyWithQueue();
+    }
+
+    public boolean isDisabled() {
+        return this.equals(DISABLED);
     }
 
     public static IndexState fromCode(@Nonnull Object code) {

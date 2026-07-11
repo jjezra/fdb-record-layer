@@ -147,8 +147,8 @@ public class FDBRecordStoreReplaceIndexTest extends FDBRecordStoreTestBase {
         final RecordMetaDataHook addBothIndexes = composeHooks(addIndexHook(recordTypeName, origIndex), addIndexHook(recordTypeName, newIndex));
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context, addBothIndexes);
-            assertTrue(recordStore.isIndexReadable(origIndex), "Old index should be readable at start");
-            assertTrue(recordStore.isIndexReadable(newIndex), "New index should be readable at start");
+            assertTrue(recordStore.getIndexState(origIndex).isReadable(), "Old index should be readable at start");
+            assertTrue(recordStore.getIndexState(newIndex).isReadable(), "New index should be readable at start");
 
             recordStore.saveRecord(TestRecords1Proto.MyOtherRecord.newBuilder()
                     .setRecNo(1415L)
@@ -166,7 +166,7 @@ public class FDBRecordStoreReplaceIndexTest extends FDBRecordStoreTestBase {
 
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context, composeHooks(addIndexAndReplacements(recordTypeName, origIndex, newIndex), bumpMetaDataVersionHook()));
-            assertTrue(recordStore.isIndexDisabled(origIndex.getName()));
+            assertTrue(recordStore.getIndexState(origIndex.getName()).isDisabled());
             commit(context);
         }
 
@@ -186,7 +186,7 @@ public class FDBRecordStoreReplaceIndexTest extends FDBRecordStoreTestBase {
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context, addBothIndexes);
             assertTrue(disableIndex(newIndex));
-            assertTrue(recordStore.isIndexReadable(origIndex), "Old index should be readable at start");
+            assertTrue(recordStore.getIndexState(origIndex).isReadable(), "Old index should be readable at start");
 
             recordStore.saveRecord(TestRecords1Proto.MySimpleRecord.newBuilder()
                     .setRecNo(1066L)
@@ -200,7 +200,7 @@ public class FDBRecordStoreReplaceIndexTest extends FDBRecordStoreTestBase {
         final RecordMetaDataHook withReplacementsHook = composeHooks(addIndexAndReplacements(recordTypeName, origIndex, newIndex), bumpMetaDataVersionHook());
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context, withReplacementsHook);
-            assertTrue(recordStore.isIndexReadable(origIndex.getName()), "Old index should be readable until replacement index is built");
+            assertTrue(recordStore.getIndexState(origIndex.getName()).isReadable(), "Old index should be readable until replacement index is built");
             final List<IndexEntry> oldIndexEntries = scanIndex(origIndex);
             assertThat(oldIndexEntries, hasSize(1));
             assertEquals(Tuple.from(1066L), oldIndexEntries.get(0).getPrimaryKey());
@@ -212,7 +212,7 @@ public class FDBRecordStoreReplaceIndexTest extends FDBRecordStoreTestBase {
 
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context, withReplacementsHook);
-            assertTrue(recordStore.isIndexDisabled(origIndex.getName()), "Old index should be disabled once replacement index is built");
+            assertTrue(recordStore.getIndexState(origIndex.getName()).isDisabled(), "Old index should be disabled once replacement index is built");
             commit(context);
         }
 
@@ -281,7 +281,7 @@ public class FDBRecordStoreReplaceIndexTest extends FDBRecordStoreTestBase {
             // Validate that each store has had the original index removed (because the replacement index was built)
             try (FDBRecordContext context = openContext()) {
                 openSimpleRecordStore(context, withReplacementHook);
-                forEachStore(multiStoreRoot, stores, (storePathName, subStore) -> assertTrue(subStore.isIndexDisabled(origIndex.getName())));
+                forEachStore(multiStoreRoot, stores, (storePathName, subStore) -> assertTrue(subStore.getIndexState(origIndex.getName()).isDisabled()));
                 commit(context);
             }
 
@@ -341,7 +341,7 @@ public class FDBRecordStoreReplaceIndexTest extends FDBRecordStoreTestBase {
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context, withReplacementsHook);
 
-            assertTrue(recordStore.isIndexReadable(origIndex));
+            assertTrue(recordStore.getIndexState(origIndex).isReadable());
             origEntries = scanIndex(origIndex);
             assertThat(origEntries, hasSize(1));
             assertEquals(Tuple.from(800L), origEntries.get(0).getPrimaryKey());
@@ -354,7 +354,7 @@ public class FDBRecordStoreReplaceIndexTest extends FDBRecordStoreTestBase {
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context, withReplacementsHook);
 
-            assertTrue(recordStore.isIndexReadable(origIndex));
+            assertTrue(recordStore.getIndexState(origIndex).isReadable());
             assertEquals(origEntries, scanIndex(origIndex));
 
             disableIndex(newIndex1);
@@ -366,7 +366,7 @@ public class FDBRecordStoreReplaceIndexTest extends FDBRecordStoreTestBase {
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context, withReplacementsHook);
 
-            assertTrue(recordStore.isIndexReadable(origIndex));
+            assertTrue(recordStore.getIndexState(origIndex).isReadable());
             assertEquals(origEntries, scanIndex(origIndex));
 
             buildIndex(newIndex1);
@@ -375,7 +375,7 @@ public class FDBRecordStoreReplaceIndexTest extends FDBRecordStoreTestBase {
 
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context, withReplacementsHook);
-            assertTrue(recordStore.isIndexDisabled(origIndex));
+            assertTrue(recordStore.getIndexState(origIndex).isDisabled());
             commit(context);
         }
 
@@ -395,9 +395,9 @@ public class FDBRecordStoreReplaceIndexTest extends FDBRecordStoreTestBase {
         final RecordMetaDataHook metaDataHook = addIndexAndReplacements(recordTypeName, origIndex, newIndex);
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context, metaDataHook);
-            assertTrue(recordStore.isIndexDisabled(origIndex), "index with replacements should begin disabled");
+            assertTrue(recordStore.getIndexState(origIndex).isDisabled(), "index with replacements should begin disabled");
             recordStore.rebuildAllIndexes().join();
-            assertTrue(recordStore.isIndexDisabled(origIndex), "index with replacements should not be built with all indexes");
+            assertTrue(recordStore.getIndexState(origIndex).isDisabled(), "index with replacements should not be built with all indexes");
             commit(context);
         }
     }
@@ -410,8 +410,8 @@ public class FDBRecordStoreReplaceIndexTest extends FDBRecordStoreTestBase {
         final RecordMetaDataHook metaDataHook = addIndexAndReplacements(recordTypeName, origIndex, newIndex);
         try (FDBRecordContext context = openContext()) {
             openSimpleRecordStore(context, metaDataHook);
-            assertTrue(recordStore.isIndexDisabled(origIndex), "index with replacements should begin disabled");
-            assertTrue(recordStore.isIndexReadable(newIndex), "newIndex should begin built");
+            assertTrue(recordStore.getIndexState(origIndex).isDisabled(), "index with replacements should begin disabled");
+            assertTrue(recordStore.getIndexState(newIndex).isReadable(), "newIndex should begin built");
             assertTrue(recordStore.getIndexesToBuild().keySet().stream().noneMatch(index -> index.getName().equals(origIndex.getName())),
                     "index with replacements should not be listed as index to build even if unbuilt");
             commit(context);

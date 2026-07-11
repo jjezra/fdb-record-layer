@@ -1709,7 +1709,7 @@ class SlidingWindowIndexTest extends FDBRecordStoreTestBase {
         try (FDBRecordContext context = openContext()) {
             openStore(context, 5, Direction.DESC);
             recordStore.markIndexWriteOnlyWithQueue(INDEX_NAME).join();
-            assertTrue(recordStore.isIndexWriteOnlyWithQueue(INDEX_NAME));
+            assertTrue(recordStore.getIndexState(INDEX_NAME).isWriteOnlyWithQueue());
 
             rec(1, 100);
             rec(2, 200);
@@ -1750,7 +1750,7 @@ class SlidingWindowIndexTest extends FDBRecordStoreTestBase {
         try (FDBRecordContext context = openContext()) {
             openStore(context, 5, Direction.DESC);
             final Index index = recordStore.getRecordMetaData().getIndex(INDEX_NAME);
-            assertTrue(recordStore.isIndexReadable(index));
+            assertTrue(recordStore.getIndexState(index).isReadable());
             assertThat(slidingWindow())
                     .hasSizeOf(2)
                     .underlyingHnsw().containsInAnyOrder(1, 2);
