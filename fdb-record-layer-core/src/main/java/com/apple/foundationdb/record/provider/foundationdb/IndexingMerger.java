@@ -54,6 +54,7 @@ import java.util.function.Function;
 public class IndexingMerger {
     private static final Logger LOGGER = LoggerFactory.getLogger(IndexingMerger.class);
     private final Index index;
+    private final Function<FDBRecordStore, CompletableFuture<Void>> heartbeatUpdater;
     private long mergesLimit;
     private int mergeSuccesses = 0;
     private long timeQuotaMillis = 0;
@@ -63,10 +64,12 @@ public class IndexingMerger {
     private StoreTimerSnapshot lastProgressSnapshot = null;
 
 
-    public IndexingMerger(final Index index,  IndexingCommon common, long initialMergesCountLimit) {
+    public IndexingMerger(final Index index, IndexingCommon common, long initialMergesCountLimit,
+                          final Function<FDBRecordStore, CompletableFuture<Void>> heartbeatUpdater) {
         this.index = index;
         this.common = common;
         this.mergesLimit = initialMergesCountLimit;
+        this.heartbeatUpdater = heartbeatUpdater;
     }
 
     private CompletableFuture<FDBRecordStore> openRecordStore(FDBRecordContext context) {
@@ -94,6 +97,8 @@ public class IndexingMerger {
                                     mergeControl.setRepartitionDocumentCount(repartitionDocumentCount);
                                     mergeControl.setLastStep(IndexDeferredMaintenanceControl.LastStep.NONE);
                                     mergeControl.setRepartitionCapped(false);
+                                    // Let deferred operations that span multiple transactions keep this session's heartbeat alive
+                                    mergeControl.setIndexingHeartbeatUpdater(heartbeatUpdater);
                                     return store.getIndexMaintainer(index).mergeIndex();
                                 })
                                 .thenApply(ignore -> false)

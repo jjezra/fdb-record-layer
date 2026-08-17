@@ -1108,7 +1108,10 @@ public abstract class IndexingBase {
         if (indexingMergerMap == null) {
             indexingMergerMap = new HashMap<>();
         }
-        return indexingMergerMap.computeIfAbsent(index.getName(), k -> new IndexingMerger(index, common, policy.getInitialMergesCountLimit()));
+        return indexingMergerMap.computeIfAbsent(index.getName(),
+                k -> new IndexingMerger(index, common, policy.getInitialMergesCountLimit(),
+                        // Long deferred operations (i.e. queue drains) should keep this session's heartbeat alive
+                        store -> updateHeartbeat(store, index)));
     }
 
     private synchronized IndexingPendingWriteQueue getIndexingDrainer(Index index) {

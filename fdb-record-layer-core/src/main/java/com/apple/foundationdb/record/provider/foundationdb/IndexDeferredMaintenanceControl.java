@@ -21,10 +21,15 @@
 package com.apple.foundationdb.record.provider.foundationdb;
 
 import com.apple.foundationdb.annotation.API;
+import com.apple.foundationdb.async.AsyncUtil;
 import com.apple.foundationdb.record.metadata.Index;
 
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 
 /**
  * Some store's indexes may need merging on some occasions. This helper module should allow the caller
@@ -44,6 +49,8 @@ public class IndexDeferredMaintenanceControl {
     private int repartitionDocumentCount = 0;
     private boolean repartitionCapped = false;
     private LastStep lastStep = LastStep.NONE;
+    @Nullable
+    private Function<FDBRecordStore, CompletableFuture<Void>> indexingHeartbeatUpdater = null;
 
 
     /**
@@ -259,5 +266,27 @@ public class IndexDeferredMaintenanceControl {
      */
     public void setRepartitionCapped(final boolean repartitionCapped) {
         this.repartitionCapped = repartitionCapped;
+    }
+
+    /**
+     * Set by the online indexer - a callback that updates this indexing session's heartbeat in a given store's
+     * transaction.
+     * @param indexingHeartbeatUpdater the callback, or null (default) if the deferred maintenance is not performed
+     * during an indexing session
+     */
+    public void setIndexingHeartbeatUpdater(@Nullable final Function<FDBRecordStore, CompletableFuture<Void>> indexingHeartbeatUpdater) {
+        this.indexingHeartbeatUpdater = indexingHeartbeatUpdater;
+    }
+
+    /**
+     * Update the indexing session's heartbeat, if this deferred maintenance is performed during an indexing session.
+     * A deferred maintenance operation that spans multiple transactions should call this function in each one of them,
+     * so that a long operation is not mistaken for an abandoned indexing session.
+     * @param store the store whose transaction the heartbeat is written to
+     * @return a future that completes when the heartbeat had been updated (or immediately, if there is no session)
+     */
+    @Nonnull
+    public CompletableFuture<Void> updateIndexingHeartbeat(@Nonnull final FDBRecordStore store) {
+        return indexingHeartbeatUpdater == null ? AsyncUtil.DONE : indexingHeartbeatUpdater.apply(store);
     }
 }
