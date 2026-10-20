@@ -90,6 +90,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @Tag(Tags.RequiresFDB)
 public class PendingWriteQueueIntegrationTest extends FDBRecordStoreTestBase {
+
     @Test
     void testPendingQueueSimple() {
         // Test simple non-partitioned pending queue life cycle
@@ -297,7 +298,8 @@ public class PendingWriteQueueIntegrationTest extends FDBRecordStoreTestBase {
             commit(context);
         }
 
-        verifyPartitionCount(schemaSetup, index, groupingKey, List.of(6));
+        // Queued inserts are not counted until drained
+        verifyPartitionCount(schemaSetup, index, groupingKey, List.of(3));
 
         // verify record is found in query (from queue)
         verifyExpectedDocIds(schemaSetup, index, "*:*", groupingKey.getLong(0), Set.of(1001L, 1002L, 1003L, 2001L, 2002L, 2003L));
@@ -501,6 +503,9 @@ public class PendingWriteQueueIntegrationTest extends FDBRecordStoreTestBase {
                 List.of(// LucenePendingWriteQueueProto.PendingWriteItem.OperationType.INSERT,
                         LucenePendingWriteQueueProto.PendingWriteItem.OperationType.DELETE));
 
+        // Queued deletes are not counted until drained
+        verifyPartitionCount(schemaSetup, index, groupingKey, List.of(5, 5));
+
         // verify record is found in query (from queue)
         verifyExpectedDocIds(schemaSetup, index, "*:*",
                 groupingKey.getLong(0), Set.of(2002L, 2003L, 2004L, 2005L, 3002L, 3003L, 3004L, 3005L));
@@ -518,6 +523,66 @@ public class PendingWriteQueueIntegrationTest extends FDBRecordStoreTestBase {
         // verify record is found in query (from queue)
         verifyExpectedDocIds(schemaSetup, index, "*:*",
                 groupingKey.getLong(0), Set.of(2002L, 2003L, 2004L, 2005L, 3002L, 3003L, 3004L, 3005L));
+    }
+
+    @Test
+    void testPartitionCountAdjustedDuringDrain() {
+        // Test that the partition count reflects queued operations only after they are drained
+        final Map<String, String> options = Map.of(
+                ENABLE_PENDING_WRITE_QUEUE_DURING_MERGE, "true",
+                INDEX_PARTITION_BY_FIELD_NAME, "timestamp",
+                LuceneIndexOptions.PRIMARY_KEY_SEGMENT_INDEX_V2_ENABLED, "true",
+                INDEX_PARTITION_HIGH_WATERMARK, String.valueOf(10));
+
+        final Index index = complexPartitionedIndex(options);
+        final KeySpacePath path = pathManager.createPath(TestKeySpace.RECORD_STORE);
+        final Function<FDBRecordContext, FDBRecordStore> schemaSetup = context ->
+                LuceneIndexTestUtils.rebuildIndexMetaData(context, path,
+                        TestRecordsTextProto.ComplexDocument.getDescriptor().getName(),
+                        index, useCascadesPlanner).getLeft();
+
+        final Tuple groupingKey = Tuple.from(1L);
+        final Integer partition0 = 0;
+
+        Map<Long, Tuple> primaryKeys = new HashMap<>();
+        try (FDBRecordContext context = openContext()) {
+            FDBRecordStore recordStore = Objects.requireNonNull(schemaSetup.apply(context));
+            for (long i = 2001L; i <= 2004L; i++) {
+                Tuple primaryKey = recordStore.saveRecord(LuceneIndexTestUtils.createComplexDocument(i, "doc " + i, 1L, 10L + i)).getPrimaryKey();
+                primaryKeys.put(i, primaryKey);
+            }
+            commit(context);
+        }
+        verifyPartitionCount(schemaSetup, index, groupingKey, List.of(4));
+
+        setOngoingMergeIndicator(schemaSetup, index, groupingKey, partition0);
+
+        // Update one, insert two, and delete one document - all queued
+        try (FDBRecordContext context = openContext()) {
+            FDBRecordStore recordStore = Objects.requireNonNull(schemaSetup.apply(context));
+            recordStore.saveRecord(LuceneIndexTestUtils.createComplexDocument(2001L, "doc 2001 updated", 1L, 10L + 2001L));
+            recordStore.saveRecord(LuceneIndexTestUtils.createComplexDocument(2005L, "doc 2005", 1L, 10L + 2005L));
+            recordStore.saveRecord(LuceneIndexTestUtils.createComplexDocument(2006L, "doc 2006", 1L, 10L + 2006L));
+            recordStore.deleteRecord(primaryKeys.get(2002L));
+            commit(context);
+        }
+
+        // Nothing is counted until drained
+        verifyPartitionCount(schemaSetup, index, groupingKey, List.of(4));
+
+        mergeIndexNow(schemaSetup, index);
+        verifyClearedQueueAndIndicator(schemaSetup, index, groupingKey, partition0);
+
+        // 4 + 2 inserted - 1 deleted (the update has no net effect)
+        verifyPartitionCount(schemaSetup, index, groupingKey, List.of(5));
+        verifyExpectedDocIds(schemaSetup, index, "*:*",
+                groupingKey.getLong(0), Set.of(2001L, 2003L, 2004L, 2005L, 2006L));
+
+        // Drain an empty queue: the accumulated count change should not be applied again
+        setOngoingMergeIndicator(schemaSetup, index, groupingKey, partition0);
+        mergeIndexNow(schemaSetup, index);
+        verifyClearedQueueAndIndicator(schemaSetup, index, groupingKey, partition0);
+        verifyPartitionCount(schemaSetup, index, groupingKey, List.of(5));
     }
 
     @Test

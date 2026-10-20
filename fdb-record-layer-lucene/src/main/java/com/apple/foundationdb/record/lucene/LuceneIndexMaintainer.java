@@ -181,6 +181,7 @@ public class LuceneIndexMaintainer extends StandardIndexMaintainer {
         if (shouldUseQueue(entry.getKey(), partitionId)) {
             PendingWriteQueue queue = directoryManager.getPendingWriteQueue(entry.getKey(), partitionId);
             queue.enqueueInsert(state.store.getContext(), newRecord.getPrimaryKey(), entry.getValue(), getIncarnationSafe(state.store));
+            // partition count will be adjusted during drain (see addRecord)
             // Require deferred merge (+ drain) in case there is a merge indicator without an active merge
             this.state.store.getIndexDeferredMaintenanceControl().setMergeRequiredIndexes(this.state.index);
         } else {
@@ -385,7 +386,10 @@ public class LuceneIndexMaintainer extends StandardIndexMaintainer {
             final FDBIndexableRecord<M> newRecord,
             final Integer destinationPartitionIdHint,
             final Map.Entry<Tuple, List<LuceneDocumentFromRecord.DocumentField>> entry) {
-        return partitioner.addToAndSavePartitionMetadata(newRecord, entry.getKey(), destinationPartitionIdHint)
+        // If the document is going to be queued, defer the partition count increment to the drain. This way, the
+        // drain does not have to update the partition metadata that user writes read and modify.
+        return partitioner.addToAndSavePartitionMetadata(newRecord, entry.getKey(), destinationPartitionIdHint,
+                        partitionId -> shouldUseQueueAsync(entry.getKey(), partitionId))
                 .thenAccept(partitionId -> writeDocument(newRecord, entry, partitionId));
     }
 
@@ -507,6 +511,11 @@ public class LuceneIndexMaintainer extends StandardIndexMaintainer {
                 throw LuceneExceptions.toRecordCoreException("Issue deleting", e, "record", record.getPrimaryKey());
             }
         });
+    }
+
+    @Nonnull
+    public CompletableFuture<Void> applyDrainedPartitionCountDelta(final @Nonnull Tuple groupingKey, int partitionId, long delta) {
+        return partitioner.adjustCountAndSave(groupingKey, Math.toIntExact(delta), partitionId);
     }
 
     @Nonnull

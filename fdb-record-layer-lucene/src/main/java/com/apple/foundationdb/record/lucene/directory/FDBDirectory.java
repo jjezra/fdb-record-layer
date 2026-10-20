@@ -77,6 +77,8 @@ import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -92,6 +94,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiFunction;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -136,6 +139,7 @@ public class FDBDirectory extends Directory {
     public static final int PENDING_WRITE_QUEUE_SUBSPACE = 8;
     public static final int ONGOING_MERGE_INDICATOR_SUBSPACE = 9;
     public static final int PENDING_QUEUE_SIZE_SUBSPACE = 10;
+    public static final int PENDING_PARTITION_COUNT_DELTA_SUBSPACE = 11;
     private final AtomicLong nextTempFileCounter = new AtomicLong();
     @Nonnull
     private final Map<String, String> indexOptions;
@@ -148,6 +152,7 @@ public class FDBDirectory extends Directory {
     private final Subspace pendingWritesQueueSubspace;
     private final Subspace ongoingMergeSubspace;
     private final Subspace pendingQueueSizeSubspace;
+    private final byte[] pendingPartitionCountDeltaKey;
     private final byte[] sequenceSubspaceKey;
 
     private final LockFactory lockFactory;
@@ -232,6 +237,7 @@ public class FDBDirectory extends Directory {
         this.pendingWritesQueueSubspace = subspace.subspace(Tuple.from(PENDING_WRITE_QUEUE_SUBSPACE));
         this.ongoingMergeSubspace = subspace.subspace(Tuple.from(ONGOING_MERGE_INDICATOR_SUBSPACE));
         this.pendingQueueSizeSubspace = subspace.subspace(Tuple.from(PENDING_QUEUE_SIZE_SUBSPACE));
+        this.pendingPartitionCountDeltaKey = subspace.pack(Tuple.from(PENDING_PARTITION_COUNT_DELTA_SUBSPACE));
         this.lockFactory = (lockFactory != null) ? lockFactory : defaultLockFactory(agilityContext);
         this.blockSize = blockSize;
         this.fileReferenceCache = new AtomicReference<>();
@@ -1035,17 +1041,47 @@ public class FDBDirectory extends Directory {
     }
 
     /**
-     * Clears the ongoing merge indicator, completing exceptionally if the queue is not empty.
+     * Accumulate a partition count change while draining the pending write queue.
+     * This is an atomic mutation, hence it does not add a read conflict to the drain's transaction. The accumulated
+     * value is applied to the partition metadata when the ongoing merge indicator is cleared (see
+     * {@link #clearOngoingMergeIndicatorIfQueueEmptyAsync(BiFunction)}).
      *
+     * @param context the drain's context
+     * @param amount the amount to add to the partition count
+     */
+    public void addToPendingPartitionCountDelta(@Nonnull FDBRecordContext context, long amount) {
+        context.ensureActive().mutate(MutationType.ADD, pendingPartitionCountDeltaKey,
+                ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(amount).array());
+    }
+
+    /**
+     * Clears the ongoing merge indicator, completing exceptionally if the queue is not empty.
+     * This transaction is expected to conflict with concurrent writes that use the queue. Hence, it is also used to
+     * apply the partition count changes that were accumulated during the drain.
+     *
+     * @param applyPartitionCountDelta if not null, called (in the same context) with a non-zero accumulated partition
+     * count change, to apply it to the partition metadata
      * @return a future that completes when the indicator is cleared
      */
-    public CompletableFuture<Void> clearOngoingMergeIndicatorIfQueueEmptyAsync() {
+    public CompletableFuture<Void> clearOngoingMergeIndicatorIfQueueEmptyAsync(
+            @Nullable BiFunction<FDBRecordContext, Long, CompletableFuture<Void>> applyPartitionCountDelta) {
         return agilityContext.apply(aContext ->
                 createPendingWritesQueue().isQueueEmpty(aContext)
-                        .thenAccept(isEmptyQueue -> {
+                        .thenCompose(isEmptyQueue -> {
                             if (Boolean.FALSE.equals(isEmptyQueue)) {
                                 throw new RecordCoreException("Cannot clear queue usage indicator: pending write queue is not empty");
                             }
+                            return aContext.ensureActive().get(pendingPartitionCountDeltaKey);
+                        })
+                        .thenCompose(deltaBytes -> {
+                            final long delta = deltaBytes == null ? 0 : ByteBuffer.wrap(deltaBytes).order(ByteOrder.LITTLE_ENDIAN).getLong();
+                            if (delta == 0 || applyPartitionCountDelta == null) {
+                                return AsyncUtil.DONE;
+                            }
+                            return applyPartitionCountDelta.apply(aContext, delta);
+                        })
+                        .thenRun(() -> {
+                            aContext.ensureActive().clear(pendingPartitionCountDeltaKey);
                             // Clear the ongoing merge indicator
                             aContext.ensureActive().clear(ongoingMergeSubspace.pack());
                         }));

@@ -548,8 +548,16 @@ public class FDBDirectoryWrapper implements AutoCloseable {
         getWriter().maybeMerge();
     }
 
-    public CompletableFuture<Void> clearOngoingMergeIndicator() {
-        return getDirectory().clearOngoingMergeIndicatorIfQueueEmptyAsync();
+    public CompletableFuture<Void> clearOngoingMergeIndicator(@Nonnull final Tuple groupingKey,
+                                                              @Nullable final Integer partitionId) {
+        if (partitionId == null) {
+            return getDirectory().clearOngoingMergeIndicatorIfQueueEmptyAsync(null);
+        }
+        // Apply the partition count changes that were accumulated by the drain
+        return getDirectory().clearOngoingMergeIndicatorIfQueueEmptyAsync((context, delta) ->
+                state.store.asBuilder().setContext(context).openAsync()
+                        .thenCompose(store -> ((LuceneIndexMaintainer)store.getIndexMaintainer(state.index))
+                                .applyDrainedPartitionCountDelta(groupingKey, partitionId, delta)));
     }
 
     public CompletableFuture<Void> drainPendingQueue(@Nonnull final Tuple groupingKey,
@@ -566,7 +574,7 @@ public class FDBDirectoryWrapper implements AutoCloseable {
         return AsyncUtil.whileTrue(() -> {
             agilityContext.flush(); // before potentially long drain (Note that the drain iteration does not use agilityContext)
             return drainPendingQueueNow(groupingKey, partitionId)
-                    .thenCompose(vIgnore -> clearOngoingMergeIndicator())
+                    .thenCompose(vIgnore -> clearOngoingMergeIndicator(groupingKey, partitionId))
                     .thenApply(vIgnore -> {
                         agilityContext.flush(); // commit clear indicator
                         return false; // done, stop looping
@@ -638,16 +646,19 @@ public class FDBDirectoryWrapper implements AutoCloseable {
 
             try {
                 final LuceneIndexMaintainer maintainer = (LuceneIndexMaintainer)store.getIndexMaintainer(state.index);
-                CompletableFuture<Void> oneItemFuture = AsyncUtil.DONE;
+                // Partition count changes are accumulated atomically, and applied when the ongoing merge indicator is
+                // cleared. Updating the partition metadata here would conflict with concurrent user writes.
                 switch (queueEntry.getOperationType()) {
                     case INSERT:
                         maintainer.writeDocumentBypassQueue(groupingKey, partitionId, queueEntry.getPrimaryKeyParsed(), queueEntry.getDocumentFieldsParsed());
+                        if (partitionId != null) {
+                            getDirectory().addToPendingPartitionCountDelta(store.getContext(), 1);
+                        }
                         break;
                     case DELETE:
                         final int countDeleted = maintainer.deleteDocumentBypassQueue(groupingKey, partitionId, queueEntry.getPrimaryKeyParsed());
-                        if (partitionId != null) {
-                            oneItemFuture = maintainer.postDeleteUpdatePartitionCounter(groupingKey, partitionId, countDeleted)
-                                    .thenApply(ignore -> null);
+                        if (partitionId != null && countDeleted > 0) {
+                            getDirectory().addToPendingPartitionCountDelta(store.getContext(), -countDeleted);
                         }
                         break;
                     case OPERATION_TYPE_UNSPECIFIED:
@@ -658,7 +669,7 @@ public class FDBDirectoryWrapper implements AutoCloseable {
                                 LogMessageKeys.CODE, queueEntry.getOperationType());
                 }
                 pendingWriteQueue.clearEntry(store.getContext(), queueEntry);
-                return oneItemFuture;
+                return AsyncUtil.DONE;
             } catch (IOException ex) {
                 throw new RecordCoreException("Lucene IOException", ex);
             }

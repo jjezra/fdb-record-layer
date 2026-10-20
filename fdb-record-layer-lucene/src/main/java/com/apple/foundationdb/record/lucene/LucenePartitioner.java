@@ -90,6 +90,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
@@ -473,26 +474,48 @@ public class LucenePartitioner {
     public <M extends Message> CompletableFuture<Integer> addToAndSavePartitionMetadata(@Nonnull FDBIndexableRecord<M> newRecord,
                                                                                         @Nonnull Tuple groupingKey,
                                                                                         @Nullable Integer assignedPartitionId) {
+        return addToAndSavePartitionMetadata(newRecord, groupingKey, assignedPartitionId, null);
+    }
+
+    /**
+     * add a new written record to its partition metadata, possibly deferring the count increment.
+     *
+     * @param newRecord record to be written
+     * @param groupingKey grouping key
+     * @param assignedPartitionId assigned partition override, if not null
+     * @param isCountDeferred if not null, applied to the assigned partition id. If it completes with {@code true}, the
+     * partition's count is not incremented, and the caller is responsible for adjusting it later (e.g. when the pending
+     * write queue is drained)
+     * @param <M> message
+     * @return partition id or <code>null</code> if partitioning isn't enabled on index
+     */
+    @Nonnull
+    public <M extends Message> CompletableFuture<Integer> addToAndSavePartitionMetadata(@Nonnull FDBIndexableRecord<M> newRecord,
+                                                                                        @Nonnull Tuple groupingKey,
+                                                                                        @Nullable Integer assignedPartitionId,
+                                                                                        @Nullable Function<Integer, CompletableFuture<Boolean>> isCountDeferred) {
         if (!isPartitioningEnabled()) {
             return CompletableFuture.completedFuture(null);
         }
-        return addToAndSavePartitionMetadata(groupingKey, toPartitionKey(newRecord), assignedPartitionId);
+        return addToAndSavePartitionMetadata(groupingKey, toPartitionKey(newRecord), assignedPartitionId, isCountDeferred);
     }
 
     /**
      * add a partition field value to the metadata of a given partition and save to db.
-     * The <code>count</code> will be incremented, and the <code>from</code> or <code>to</code> boundary values will
-     * be adjusted if applicable.
+     * The <code>count</code> will be incremented (unless deferred), and the <code>from</code> or <code>to</code> boundary
+     * values will be adjusted if applicable.
      *
      * @param groupingKey grouping key
      * @param partitioningKey partitioning key
      * @param assignedPartitionIdOverride assigned partition override, if not null
+     * @param isCountDeferred if not null and completes with {@code true} for the assigned partition id, do not increment the count
      * @return assigned partition id
      */
     @Nonnull
     private CompletableFuture<Integer> addToAndSavePartitionMetadata(@Nonnull final Tuple groupingKey,
                                                                      @Nonnull final Tuple partitioningKey,
-                                                                     @Nullable final Integer assignedPartitionIdOverride) {
+                                                                     @Nullable final Integer assignedPartitionIdOverride,
+                                                                     @Nullable final Function<Integer, CompletableFuture<Boolean>> isCountDeferred) {
         return state.context.doWithWriteLock(new LockIdentifier(partitionMetadataSubspace(groupingKey)),
                 () -> {
                     final CompletableFuture<LucenePartitionInfoProto.LucenePartitionInfo> assignmentFuture;
@@ -501,20 +524,26 @@ public class LucenePartitioner {
                     } else {
                         assignmentFuture = getOrCreatePartitionInfo(groupingKey, partitioningKey);
                     }
-                    return assignmentFuture.thenApply(assignedPartition -> {
+                    return assignmentFuture.thenCompose(assignedPartition -> {
                         // assignedPartition is not null, since a new one is created by the previous call if none exist
-                        LucenePartitionInfoProto.LucenePartitionInfo.Builder builder = Objects.requireNonNull(assignedPartition).toBuilder();
-                        builder.setCount(assignedPartition.getCount() + 1);
-                        if (isOlderThan(partitioningKey, assignedPartition)) {
-                            // clear the previous key
-                            state.context.ensureActive().clear(partitionMetadataKeyFromPartitioningValue(groupingKey, getPartitionKey(assignedPartition)));
-                            builder.setFrom(ByteString.copyFrom(partitioningKey.pack()));
-                        }
-                        if (isNewerThan(partitioningKey, assignedPartition)) {
-                            builder.setTo(ByteString.copyFrom(partitioningKey.pack()));
-                        }
-                        savePartitionMetadata(groupingKey, builder);
-                        return assignedPartition.getId();
+                        final int assignedPartitionId = Objects.requireNonNull(assignedPartition).getId();
+                        return (isCountDeferred == null ? AsyncUtil.READY_FALSE : isCountDeferred.apply(assignedPartitionId))
+                                .thenApply(countDeferred -> {
+                                    LucenePartitionInfoProto.LucenePartitionInfo.Builder builder = assignedPartition.toBuilder();
+                                    if (!Boolean.TRUE.equals(countDeferred)) {
+                                        builder.setCount(assignedPartition.getCount() + 1);
+                                    }
+                                    if (isOlderThan(partitioningKey, assignedPartition)) {
+                                        // clear the previous key
+                                        state.context.ensureActive().clear(partitionMetadataKeyFromPartitioningValue(groupingKey, getPartitionKey(assignedPartition)));
+                                        builder.setFrom(ByteString.copyFrom(partitioningKey.pack()));
+                                    }
+                                    if (isNewerThan(partitioningKey, assignedPartition)) {
+                                        builder.setTo(ByteString.copyFrom(partitioningKey.pack()));
+                                    }
+                                    savePartitionMetadata(groupingKey, builder);
+                                    return assignedPartitionId;
+                                });
                     });
                 });
     }
@@ -615,17 +644,29 @@ public class LucenePartitioner {
      */
     CompletableFuture<Void> decrementCountAndSave(@Nonnull Tuple groupingKey,
                                                   int amount, final int partitionId) {
+        return adjustCountAndSave(groupingKey, -amount, partitionId);
+    }
+
+    /**
+     * add a (positive or negative) delta to the doc count of a partition, and save its partition metadata.
+     *
+     * @param groupingKey grouping key
+     * @param delta amount to add to the doc count
+     * @param partitionId the id of the partition to adjust
+     */
+    CompletableFuture<Void> adjustCountAndSave(@Nonnull Tuple groupingKey,
+                                               int delta, final int partitionId) {
         return state.context.doWithWriteLock(new LockIdentifier(partitionMetadataSubspace(groupingKey)),
                 () -> getPartitionMetaInfoById(partitionId, groupingKey).thenAccept(serialized -> {
                     if (serialized == null) {
-                        throw new RecordCoreInternalException("Lucene partition metadata changed during delete")
+                        throw new RecordCoreInternalException("Lucene partition metadata changed during count update")
                                 .addLogInfo(LogMessageKeys.INDEX_NAME, state.index.getName())
                                 .addLogInfo(LogMessageKeys.INDEX_SUBSPACE, state.indexSubspace);
                     }
                     LucenePartitionInfoProto.LucenePartitionInfo.Builder builder = Objects.requireNonNull(serialized).toBuilder();
                     // note that the to/from of the partition do not get updated, since that would require us to know
                     // what the next potential boundary value(s) are. The counts, nonetheless, remain valid.
-                    builder.setCount(serialized.getCount() - amount);
+                    builder.setCount(serialized.getCount() + delta);
 
                     if (builder.getCount() < 0) {
                         // should never happen
